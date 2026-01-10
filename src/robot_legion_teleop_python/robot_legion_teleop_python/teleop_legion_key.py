@@ -2,21 +2,24 @@
 """
 teleop_legion_key.py
 
-Keyboard teleop for swarm robotics applications:
-- On startup, teleop scans the network and prints a list of available robots.
-- "Available robot" means: there exists a topic /<robot>/cmd_vel of type geometry_msgs/msg/Twist
-  AND there is at least one subscriber on that topic (i.e., a motor driver node is listening).
-- User is prompted to enter a robot name. Invalid names are rejected and re-prompted.
-- Once a valid robot is selected, teleop prints instructions and begins control.
+Keyboard teleop for swarm robotics applications (robot-agnostic)
 
-Robot switching:
-- Press 'm' anytime to rescan and switch robots (validated against available robots).
+Core behaviors:
+- Robots are identified by "robot name" (default = Linux username on robot)
+- A robot is considered "available" if there is at least one subscriber on:
+    /<robot_name>/cmd_vel
+  (i.e., motor_driver_node is running on that robot)
 
-Publishing behavior:
-- Teleop publishes Twist to /<robot_name>/cmd_vel
-- Teleop publishes active robot name to:
-    - /active_robot
-    - /teleop/active_robot   (used by fpv_camera_mux)
+Startup:
+- Prints list of available robots, prompts user to pick one.
+- Keeps prompting until a valid robot name is entered.
+
+Switching:
+- Press 'm' any time to switch robot (same validation loop).
+
+Offline detection:
+- While driving, if the current robot stops subscribing to /<robot>/cmd_vel,
+  teleop stops and returns to selection prompt.
 
 Tracked robot turning:
 - '4' rotates LEFT  (left track backward, right track forward)  -> angular.z positive
@@ -29,12 +32,12 @@ Circle turns (smallest radius; ONE TRACK ONLY):
 - 3 backward-right: LEFT track backward, RIGHT track stopped
 """
 
+import re
 import sys
-import time
 import select
 import termios
 import tty
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import rclpy
 from rclpy.node import Node
@@ -42,7 +45,8 @@ from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 
 
-# ---------------- Terminal helpers ----------------
+CMD_VEL_RE = re.compile(r"^/([^/]+)/cmd_vel$")
+
 
 def get_key(settings):
     """Read a single keypress (with arrow-key escape sequence support)."""
@@ -50,44 +54,38 @@ def get_key(settings):
     rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
     if rlist:
         key = sys.stdin.read(1)
-        if key == '\x1b':  # start of escape sequence
+        if key == "\x1b":  # start of escape sequence
             key += sys.stdin.read(2)
         return key
-    return ''
+    return ""
 
 
 def restore_terminal_settings(settings):
     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
 
 
-# ---------------- Teleop Node ----------------
-
 class RobotLegionTeleop(Node):
     def __init__(self):
-        super().__init__('robot_legion_teleop_python')
+        super().__init__("robot_legion_teleop_python")
 
-        # Optional startup hints (we still validate against discovered robots)
-        self.declare_parameter('startup_robot', '')
-        self.declare_parameter('startup_cmd_vel_topic', '')
+        # Optional parameters (kept, but now robot selection is interactive by default)
+        self.declare_parameter("allow_cmd_vel_switching", True)
+        self.allow_cmd_vel_switching = bool(self.get_parameter("allow_cmd_vel_switching").value)
 
-        # Safety: if False, 'm' will NOT change cmd_vel topic (real robot mode).
-        self.declare_parameter('allow_cmd_vel_switching', True)
-        self.allow_cmd_vel_switching = bool(self.get_parameter('allow_cmd_vel_switching').value)
+        # Used for circle-turn math (must match motor_driver_node)
+        self.declare_parameter("wheel_separation", 0.18)
+        self.wheel_separation = float(self.get_parameter("wheel_separation").value)
 
-        # Match motor_driver_node default wheel_separation (used for circle-turn math)
-        self.declare_parameter('wheel_separation', 0.18)  # meters between tracks
-        self.wheel_separation = float(self.get_parameter('wheel_separation').value)
+        # Active robot publishers (used by fpv_camera_mux)
+        self.active_robot_pub = self.create_publisher(String, "/active_robot", 10)
+        self.active_robot_teleop_pub = self.create_publisher(String, "/teleop/active_robot", 10)
 
-        # Active robot publishers
-        self.active_robot_pub = self.create_publisher(String, '/active_robot', 10)
-        self.active_robot_teleop_pub = self.create_publisher(String, '/teleop/active_robot', 10)
-
-        # Teleop publisher (created once we have a target)
+        # Publisher created after robot selection
         self.publisher_ = None
         self.cmd_vel_topic: Optional[str] = None
         self.current_robot_name: Optional[str] = None
 
-        # Base speed profile (SLOW)
+        # Speed profile
         self.linear_speed = 0.5
         self.angular_speed = 1.0
         self.speed_step = 1.1
@@ -95,81 +93,77 @@ class RobotLegionTeleop(Node):
         self.base_slow_linear = self.linear_speed
         self.base_slow_angular = self.angular_speed
 
-        # Derived profiles
         self.medium_linear = self.base_slow_linear * (self.speed_step ** 10)
         self.medium_angular = self.base_slow_angular * (self.speed_step ** 10)
         self.fast_linear = self.base_slow_linear * (self.speed_step ** 15)
         self.fast_angular = self.base_slow_angular * (self.speed_step ** 10)
 
-        # Last commanded direction (for republish robustness)
+        # Republish state
         self.last_lin_mult = 0.0
         self.last_ang_mult = 0.0
         self.last_twist = Twist()
         self.is_moving = False
 
-        # KEYMAP
+        # KEYMAP (7/9/1/3 handled specially for one-track-only circles)
         self.move_bindings = {
             # Arrow keys
-            '\x1b[A': ('twist', 1, 0),     # up
-            '\x1b[B': ('twist', -1, 0),    # down
-            '\x1b[D': ('twist', 0, 1),     # left  (rotate left)
-            '\x1b[C': ('twist', 0, -1),    # right (rotate right)
+            "\x1b[A": ("twist", 1, 0),     # up
+            "\x1b[B": ("twist", -1, 0),    # down
+            "\x1b[D": ("twist", 0, 1),     # left  (rotate left)
+            "\x1b[C": ("twist", 0, -1),    # right (rotate right)
 
             # Numpad
-            '8': ('twist', 1, 0),          # forward
-            '2': ('twist', -1, 0),         # backward
+            "8": ("twist", 1, 0),          # forward
+            "2": ("twist", -1, 0),         # backward
 
             # Rotate in place
-            '4': ('twist', 0, 1),          # rotate LEFT
-            '6': ('twist', 0, -1),         # rotate RIGHT
+            "4": ("twist", 0, 1),          # rotate LEFT
+            "6": ("twist", 0, -1),         # rotate RIGHT
 
             # One-track-only circle turns (handled specially)
-            '7': ('circle', None, None),   # forward-left  (right track only)
-            '9': ('circle', None, None),   # forward-right (left track only)
-            '1': ('circle', None, None),   # backward-left (right track only)
-            '3': ('circle', None, None),   # backward-right(left track only)
+            "7": ("circle", None, None),   # forward-left  (right track only)
+            "9": ("circle", None, None),   # forward-right (left track only)
+            "1": ("circle", None, None),   # backward-left (right track only)
+            "3": ("circle", None, None),   # backward-right(left track only)
         }
 
         self.speed_bindings = {
-            'w': self._increase_both_speeds,
-            '+': self._increase_both_speeds,
-            'e': self._decrease_both_speeds,
-            '-': self._decrease_both_speeds,
-            'q': self._increase_linear_speed,
-            '/': self._increase_linear_speed,
-            'r': self._decrease_linear_speed,
-            '*': self._decrease_linear_speed,
-            'i': self._set_slow_profile,
-            'o': self._set_medium_profile,
-            'p': self._set_fast_profile,
+            "w": self._increase_both_speeds,
+            "+": self._increase_both_speeds,
+            "e": self._decrease_both_speeds,
+            "-": self._decrease_both_speeds,
+            "q": self._increase_linear_speed,
+            "/": self._increase_linear_speed,
+            "r": self._decrease_linear_speed,
+            "*": self._decrease_linear_speed,
+            "i": self._set_slow_profile,
+            "o": self._set_medium_profile,
+            "p": self._set_fast_profile,
         }
 
-        # Republish timer for robustness across Wi-Fi/DDS.
+        # Timers
         self.create_timer(0.1, self._republish_last_twist)
+        self.create_timer(0.5, self._offline_watchdog)
 
-        # Record any startup hints (still validated later)
-        self.startup_robot_hint = self.get_parameter('startup_robot').get_parameter_value().string_value.strip()
-        self.startup_topic_hint = self.get_parameter('startup_cmd_vel_topic').get_parameter_value().string_value.strip()
-
-        # NOTE: We do not immediately print instructions here anymore.
-        # We first perform TRUE SWARM startup selection in run() before switching terminal to raw mode.
+        # Start with instructions + robot picker
+        self._print_instructions(None)
+        print("[STARTUP] Discovering robots on the ROS 2 network...")
+        # Robot selection will happen inside run() so we can safely use input()
 
     # ---------------- Printing ----------------
 
     def _print_instructions(self, topic_name: Optional[str]):
         print("--------------------------------------------------")
-        print(" Robot Legion Teleop (Python) - TRUE SWARM MODE")
+        print(" Robot Legion Teleop (Python) - Robot-Agnostic")
         print("--------------------------------------------------")
         if topic_name:
             print(f"Publishing Twist on: {topic_name}")
         else:
-            print("Publishing Twist on: (none yet)")
+            print("Publishing Twist on: (none yet) - you will select a robot")
         print(f"allow_cmd_vel_switching: {self.allow_cmd_vel_switching}")
         print(f"wheel_separation (for circle turns): {self.wheel_separation:.3f} m")
         if self.current_robot_name:
             print(f"Active robot: {self.current_robot_name}")
-        print("")
-        print("For best results, use the numpad (with numlock enabled) on your keyboard to control robots")
         print("")
         print("Movement:")
         print("  8 forward, 2 backward")
@@ -191,7 +185,7 @@ class RobotLegionTeleop(Node):
         print("  q// increase linear, r/* decrease linear")
         print("")
         print("Robot selection:")
-        print("  m rescan + choose robot")
+        print("  m choose robot (publishes to /<robot>/cmd_vel)")
         print("")
         print("CTRL-C to quit.")
         print("--------------------------------------------------")
@@ -200,127 +194,59 @@ class RobotLegionTeleop(Node):
     def _print_current_speeds(self):
         print(f"Linear Speed: {self.linear_speed:.3f}  Angular Speed: {self.angular_speed:.3f}")
 
-    # ---------------- Robot discovery (TRUE SWARM) ----------------
+    # ---------------- Discovery helpers ----------------
 
-    def _extract_robot_name_from_topic(self, topic: str) -> Optional[str]:
+    def _topic_to_robot(self, topic: str) -> Optional[str]:
+        m = CMD_VEL_RE.match(topic)
+        return m.group(1) if m else None
+
+    def _discover_candidate_cmd_vel_topics(self) -> List[str]:
         """
-        Expect /<robot>/cmd_vel. Return <robot> if match, else None.
+        Return topics that look like /<robot>/cmd_vel.
         """
-        if not topic:
-            return None
-        if not topic.startswith('/'):
-            topic = '/' + topic
-        parts = topic.split('/')
-        # ['', '<robot>', 'cmd_vel']
-        if len(parts) == 3 and parts[2] == 'cmd_vel' and parts[1]:
-            return parts[1]
-        return None
+        topics_and_types = self.get_topic_names_and_types()
+        topics = [t for (t, _types) in topics_and_types]
+        return [t for t in topics if CMD_VEL_RE.match(t)]
 
-    def _discover_available_robots(self) -> Tuple[List[str], Dict[str, str]]:
+    def list_available_robots(self) -> List[str]:
         """
-        Returns:
-          - sorted list of robot names
-          - mapping {robot_name: cmd_vel_topic}
-        Criteria:
-          - topic matches /<robot>/cmd_vel
-          - type includes geometry_msgs/msg/Twist
-          - has >=1 subscriber (motor driver node listening)
+        Available robots are those with at least one subscriber on /<robot>/cmd_vel.
+        That means the robot's motor driver node is up and listening.
         """
-        robots: Dict[str, str] = {}
+        robots: Set[str] = set()
+        for t in self._discover_candidate_cmd_vel_topics():
+            subs = self.get_subscriptions_info_by_topic(t)
+            if subs and len(subs) > 0:
+                robot = self._topic_to_robot(t)
+                if robot:
+                    robots.add(robot)
+        return sorted(robots)
 
-        # Graph: topics + types
-        topic_map = self.get_topic_names_and_types()
-
-        for topic_name, types in topic_map:
-            robot = self._extract_robot_name_from_topic(topic_name)
-            if not robot:
-                continue
-
-            # Must be Twist topic
-            if not any(t.endswith('geometry_msgs/msg/Twist') or t == 'geometry_msgs/msg/Twist' for t in types):
-                continue
-
-            # Must have at least one subscriber
-            try:
-                subs_info = self.get_subscriptions_info_by_topic(topic_name)
-            except Exception:
-                subs_info = []
-
-            if subs_info and len(subs_info) > 0:
-                robots[robot] = topic_name
-
-        robot_list = sorted(robots.keys())
-        return robot_list, robots
-
-    def _print_available_robots(self, robots: List[str]):
-        print("\n================= AVAILABLE ROBOTS =================")
+    def _print_robot_list(self, robots: List[str]):
+        print("")
+        print("==== Available robots (subscribers on /<robot>/cmd_vel) ====")
         if not robots:
-            print("No robots found yet.")
-            print("A robot is considered 'available' if it has a /<robot>/cmd_vel topic")
-            print("of type geometry_msgs/msg/Twist AND a motor driver is subscribed to it.")
+            print("  (none found)")
+            print("  - Make sure each robot is on the same ROS_DOMAIN_ID and network.")
+            print("  - Make sure motor_driver_node is running on each robot.")
         else:
             for r in robots:
-                print(f" - {r}")
-        print("====================================================\n")
+                print(f"  - {r}")
+        print("===========================================================")
+        print("")
 
-    def _prompt_user_for_robot(self, robots: List[str]) -> Optional[str]:
+    def _validate_robot_name(self, name: str) -> Tuple[bool, str]:
         """
-        Prompt until the user enters a valid robot name.
-        Returns selected robot name, or None if user cancels (not used on startup).
+        Returns (is_valid, cmd_vel_topic).
         """
-        robots_set = set(robots)
-
-        while True:
-            user_input = input("Enter a robot name (or press Enter to rescan): ").strip()
-            if user_input == '':
-                return None  # rescan
-            if user_input in robots_set:
-                return user_input
-            print(f"[INVALID] '{user_input}' is not an available robot. Please try again.\n")
-
-    def _true_swarm_startup_select_robot(self):
-        """
-        TRUE SWARM startup flow:
-          - discover robots
-          - print list
-          - prompt until valid name chosen
-        """
-        # First: if hints exist, we can try to prefer them, but we still show list & validate.
-        preferred_robot: Optional[str] = None
-        if self.startup_topic_hint:
-            inferred = self._extract_robot_name_from_topic(self.startup_topic_hint.strip())
-            if inferred:
-                preferred_robot = inferred
-        elif self.startup_robot_hint:
-            preferred_robot = self.startup_robot_hint
-
-        while rclpy.ok():
-            robots, robot_to_topic = self._discover_available_robots()
-            self._print_available_robots(robots)
-
-            # If preferred_robot exists and is valid, offer it as a shortcut.
-            if preferred_robot and preferred_robot in robot_to_topic:
-                ans = input(f"Press Enter to choose '{preferred_robot}', or type another robot name: ").strip()
-                if ans == '':
-                    chosen = preferred_robot
-                else:
-                    if ans in robot_to_topic:
-                        chosen = ans
-                    else:
-                        print(f"[INVALID] '{ans}' is not an available robot. Try again.\n")
-                        continue
-            else:
-                chosen = self._prompt_user_for_robot(robots)
-                if chosen is None:
-                    # User requested rescan (or there were no robots)
-                    if not robots:
-                        input("Press Enter to rescan...")
-                    continue
-
-            # Apply the chosen robot
-            topic = robot_to_topic.get(chosen, f'/{chosen}/cmd_vel')
-            self._apply_cmd_vel_topic(topic, announce_startup=True)
-            return
+        name = name.strip()
+        if not name:
+            return False, ""
+        topic = f"/{name}/cmd_vel"
+        subs = self.get_subscriptions_info_by_topic(topic)
+        if subs and len(subs) > 0:
+            return True, topic
+        return False, topic
 
     # ---------------- Active robot helpers ----------------
 
@@ -334,18 +260,17 @@ class RobotLegionTeleop(Node):
 
     # ---------------- Topic application ----------------
 
-    def _apply_cmd_vel_topic(self, new_topic: str, announce_startup: bool = False):
-        if not new_topic.startswith('/'):
-            new_topic = '/' + new_topic
+    def _apply_cmd_vel_topic(self, new_topic: str):
+        if not new_topic.startswith("/"):
+            new_topic = "/" + new_topic
 
-        if new_topic == '/cmd_vel':
-            print("[ERROR] Refusing to use /cmd_vel. Use /<robot_name>/cmd_vel for multi-robot architecture.")
+        if new_topic == "/cmd_vel":
+            print("[ERROR] Refusing to use /cmd_vel. Use /<robot>/cmd_vel for multi-robot architecture.")
             return
 
-        new_robot_name = self._extract_robot_name_from_topic(new_topic)
-        if new_robot_name:
-            self.current_robot_name = new_robot_name
-            self._publish_active_robot()
+        robot = self._topic_to_robot(new_topic)
+        if robot:
+            self.current_robot_name = robot
 
         if self.publisher_ is not None:
             try:
@@ -356,13 +281,9 @@ class RobotLegionTeleop(Node):
         self.publisher_ = self.create_publisher(Twist, new_topic, 10)
         self.cmd_vel_topic = new_topic
 
-        if announce_startup:
-            self._print_instructions(new_topic)
-            print(f"[STARTUP] Now controlling: {self.current_robot_name}")
-        else:
-            print(f"[ROBOT SWITCH] Now publishing Twist to: {new_topic}")
-            if self.current_robot_name:
-                print(f"[ACTIVE ROBOT] Now controlling: {self.current_robot_name}")
+        self._publish_active_robot()
+        self._print_instructions(new_topic)
+        print(f"[ACTIVE ROBOT] Now controlling: {self.current_robot_name}")
 
     # ---------------- Circle-turn helper ----------------
 
@@ -387,9 +308,10 @@ class RobotLegionTeleop(Node):
 
         self.last_twist = twist
         self.is_moving = True
+
         self.publisher_.publish(twist)
 
-    # ---------------- Republish (robust driving) ----------------
+    # ---------------- Republish + Offline watchdog ----------------
 
     def _republish_last_twist(self):
         if not self.is_moving or self.publisher_ is None:
@@ -406,6 +328,41 @@ class RobotLegionTeleop(Node):
         twist.linear.x = self.linear_speed * self.last_lin_mult
         twist.angular.z = self.angular_speed * self.last_ang_mult
         self.publisher_.publish(twist)
+
+    def _offline_watchdog(self):
+        """
+        If current cmd_vel topic has no subscribers, the robot is "offline".
+        Stop and force re-selection.
+        """
+        if self.publisher_ is None or not self.cmd_vel_topic or not self.current_robot_name:
+            return
+
+        subs = self.get_subscriptions_info_by_topic(self.cmd_vel_topic)
+        if subs and len(subs) > 0:
+            return
+
+        # Robot went offline
+        print("")
+        print(f"[OFFLINE] Robot '{self.current_robot_name}' appears offline (no subscribers on {self.cmd_vel_topic}).")
+        print("[OFFLINE] Stopping and returning to robot selection.")
+        try:
+            self.publisher_.publish(Twist())
+        except Exception:
+            pass
+
+        self.is_moving = False
+        self.last_lin_mult = 0.0
+        self.last_ang_mult = 0.0
+        self.last_twist = Twist()
+
+        # Destroy publisher so main loop forces selection again
+        try:
+            self.destroy_publisher(self.publisher_)
+        except Exception:
+            pass
+        self.publisher_ = None
+        self.cmd_vel_topic = None
+        self.current_robot_name = None
 
     # ---------------- Speed modifiers ----------------
 
@@ -442,80 +399,84 @@ class RobotLegionTeleop(Node):
         self.angular_speed = self.fast_angular
         self._print_current_speeds()
 
-    # ---------------- Robot switching (validated) ----------------
+    # ---------------- Robot selection prompt ----------------
 
-    def _switch_robot_prompt_validated(self, settings):
+    def _prompt_until_valid_robot(self, settings):
         """
-        'm' key behavior: rescan available robots (those with subscribed /<robot>/cmd_vel)
-        and force user to choose a valid robot.
+        Print robots, prompt until user enters a valid robot name.
         """
-        if not self.allow_cmd_vel_switching:
-            print("[ROBOT SWITCH] cmd_vel switching disabled (allow_cmd_vel_switching:=False).")
-            print(f"              Staying on: {self.cmd_vel_topic}")
-            return
+        while rclpy.ok():
+            robots = self.list_available_robots()
+            self._print_robot_list(robots)
 
-        restore_terminal_settings(settings)
-        try:
-            while True:
-                robots, robot_to_topic = self._discover_available_robots()
-                self._print_available_robots(robots)
-
-                if not robots:
-                    input("No robots available. Press Enter to rescan (or CTRL-C to quit)...")
-                    continue
-
-                ans = input("Enter robot name to control (or press Enter to cancel): ").strip()
-                if ans == '':
-                    break
-                if ans not in robot_to_topic:
-                    print(f"[INVALID] '{ans}' is not an available robot. Try again.\n")
-                    continue
-
-                self._apply_cmd_vel_topic(robot_to_topic[ans], announce_startup=False)
-                break
-        finally:
+            restore_terminal_settings(settings)
+            try:
+                user_input = input("[SELECT ROBOT] Enter robot name (or 'r' to refresh): ").strip()
+            except Exception:
+                tty.setraw(sys.stdin.fileno())
+                continue
             tty.setraw(sys.stdin.fileno())
+
+            if user_input.lower() == "r":
+                continue
+
+            ok, topic = self._validate_robot_name(user_input)
+            if not ok:
+                print(f"[INVALID] '{user_input}' is not an available robot (no subscriber on {topic}). Try again.\n")
+                continue
+
+            if not self.allow_cmd_vel_switching and self.publisher_ is not None:
+                print("[ROBOT SWITCH] Switching disabled (allow_cmd_vel_switching:=False).")
+                return
+
+            self._apply_cmd_vel_topic(topic)
+            return
 
     # ---------------- Main loop ----------------
 
     def run(self):
-        # TRUE SWARM STARTUP SELECTION (before terminal raw mode)
-        self._true_swarm_startup_select_robot()
-
         settings = termios.tcgetattr(sys.stdin)
+
+        # initial selection
+        self._prompt_until_valid_robot(settings)
+
         try:
             while rclpy.ok():
                 key = get_key(settings)
-                if key == '':
+                if key == "":
                     continue
-                if key == '\x03':  # Ctrl-C
+                if key == "\x03":  # Ctrl-C
                     break
 
+                # If we currently have no robot selected (offline or startup), force selection
                 if self.publisher_ is None:
-                    # Should not happen because startup selection enforces a robot,
-                    # but keep behavior safe.
-                    if key == 'm':
-                        self._switch_robot_prompt_validated(settings)
+                    if key == "m":
+                        self._prompt_until_valid_robot(settings)
                     elif key in self.speed_bindings:
                         self.speed_bindings[key]()
+                    elif key in (" ", "5", "s"):
+                        print("[STOP] (no robot selected)")
+                    else:
+                        print("[INFO] No robot selected. Press 'm' to select a robot.")
                     continue
 
+                # Movement keys
                 if key in self.move_bindings:
                     mode, lin_mult, ang_mult = self.move_bindings[key]
 
-                    if mode == 'circle':
+                    if mode == "circle":
                         S = self.linear_speed
-
-                        if key == '7':
+                        if key == "7":
                             self._publish_one_track_circle(v_left=0.0, v_right=+S)
-                        elif key == '9':
+                        elif key == "9":
                             self._publish_one_track_circle(v_left=+S, v_right=0.0)
-                        elif key == '1':
+                        elif key == "1":
                             self._publish_one_track_circle(v_left=0.0, v_right=-S)
-                        elif key == '3':
+                        elif key == "3":
                             self._publish_one_track_circle(v_left=-S, v_right=0.0)
                         continue
 
+                    # Normal twist
                     self.last_lin_mult = float(lin_mult)
                     self.last_ang_mult = float(ang_mult)
 
@@ -528,7 +489,8 @@ class RobotLegionTeleop(Node):
                     self.publisher_.publish(twist)
                     continue
 
-                if key in (' ', '5', 's'):
+                # Stop
+                if key in (" ", "5", "s"):
                     self.publisher_.publish(Twist())
                     self.is_moving = False
                     self.last_lin_mult = 0.0
@@ -537,17 +499,22 @@ class RobotLegionTeleop(Node):
                     print("[STOP]")
                     continue
 
-                if key == 'm':
-                    self._switch_robot_prompt_validated(settings)
+                # Switch robot
+                if key == "m":
+                    self._prompt_until_valid_robot(settings)
                     continue
 
+                # Speed controls
                 if key in self.speed_bindings:
                     self.speed_bindings[key]()
                     continue
 
         finally:
-            if self.publisher_ is not None:
-                self.publisher_.publish(Twist())
+            try:
+                if self.publisher_ is not None:
+                    self.publisher_.publish(Twist())
+            except Exception:
+                pass
             restore_terminal_settings(settings)
 
 
@@ -561,5 +528,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
