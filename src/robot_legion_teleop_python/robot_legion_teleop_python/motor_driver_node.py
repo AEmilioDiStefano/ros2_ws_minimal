@@ -16,16 +16,31 @@ class MotorDriverNode(Node):
     def __init__(self):
         super().__init__('motor_driver_node')
 
-        # Parameters
+        # ---------------- Parameters ----------------
         self.declare_parameter('wheel_separation', 0.18)   # meters
         self.declare_parameter('max_linear_speed', 0.4)    # m/s
         self.declare_parameter('max_angular_speed', 2.0)   # rad/s
         self.declare_parameter('max_pwm', 100)             # percent
 
-        self.declare_parameter('cmd_vel_topic', '/emiliobot/cmd_vel')
-        self.cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
+        # Robot/topic selection (robot-agnostic)
+        # Priority:
+        #   1) cmd_vel_topic (explicit override)
+        #   2) robot_name -> /<robot_name>/cmd_vel
+        #   3) relative 'cmd_vel' (best with namespaces)
+        self.declare_parameter('robot_name', '')
+        self.declare_parameter('cmd_vel_topic', '')
 
-        # GPIO pins (BCM)
+        robot_name = self.get_parameter('robot_name').get_parameter_value().string_value.strip()
+        cmd_vel_topic_override = self.get_parameter('cmd_vel_topic').get_parameter_value().string_value.strip()
+
+        if cmd_vel_topic_override:
+            self.cmd_vel_topic = cmd_vel_topic_override
+        elif robot_name:
+            self.cmd_vel_topic = f'/{robot_name}/cmd_vel'
+        else:
+            self.cmd_vel_topic = 'cmd_vel'  # relative (namespaced-friendly)
+
+        # ---------------- GPIO pins (BCM) ----------------
         self.EN_A = 12
         self.IN1 = 17
         self.IN2 = 27
@@ -39,11 +54,9 @@ class MotorDriverNode(Node):
         if GPIO_AVAILABLE:
             self._setup_gpio()
         else:
-            self.get_logger().warn(
-                'RPi.GPIO not available. Motors will NOT move.'
-            )
+            self.get_logger().warn('RPi.GPIO not available. Motors will NOT move.')
 
-        # Subscriber
+        # ---------------- Subscriber ----------------
         self.subscription = self.create_subscription(
             Twist,
             self.cmd_vel_topic,
@@ -51,12 +64,14 @@ class MotorDriverNode(Node):
             10
         )
 
-        # Watchdog
+        # ---------------- Watchdog ----------------
         self.last_cmd_time = time.time()
         self.timeout_sec = 0.5
         self.create_timer(0.1, self._watchdog)
 
-        self.get_logger().info(f"Motor driver listening on {self.cmd_vel_topic}")
+        self.get_logger().info(f"Motor driver listening on: {self.cmd_vel_topic}")
+        if robot_name:
+            self.get_logger().info(f"Motor driver robot_name: {robot_name}")
 
     # --------------------------------------------------
 

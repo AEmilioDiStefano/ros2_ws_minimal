@@ -26,7 +26,10 @@ setup(
             # Real robot motor driver (L298N + yellow motors)
             'motor_driver_node = robot_legion_teleop_python.motor_driver_node:main',
 
-            # Real-world camera node (emiliobot camera publisher)
+            # Real-world camera node (robot-agnostic)
+            'legion_camera_node = robot_legion_teleop_python.legion_camera_node:main',
+
+            # Backward-compatible alias (optional)
             'emiliobot_camera = robot_legion_teleop_python.legion_camera_node:main',
 
             # Gazebo reset utility
