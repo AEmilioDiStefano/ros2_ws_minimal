@@ -1,8 +1,6 @@
-This is the minimal version of **AEmilioDistefano's ros2_ws repository**.
+This is the minimal version of **AEmilioDistefano's ros2_ws repository**.  This version **does not include any virtualization** and **only includes what is necvessary control your robot(s) in the real world**.
 
-**Clone this repository** onto your robot's Raspberry Pi **rather than the ros2_ws repository**.
-
-**You don't need virtualization on your Pi**, and **cloning the entire ros2_ws repository** (which includes virtualization) onto your Pi **will dramatically increase the time it takes to clone the ros2_ws repository onto your Pi**.
+When cloning onto a Raspberry Pi, **always clone this repository rather than the full version of the ros2_ws repository**.
 
 # IRL Robot Setup (differential drive) 
 
