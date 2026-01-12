@@ -2,7 +2,7 @@ This is the minimal version of **AEmilioDistefano's ros2_ws repository**.  This 
 
 When cloning onto a Raspberry Pi, **always clone this repository rather than the full version of the ros2_ws repository**.
 
-# IRL Robot Setup (differential drive) 
+# DIY Robot Setup (differential drive) 
 
 By the end of this instructional you will have built **your own differential drive robot**, controllable via WiFi with your keyboard and ready for autonomous functions
 
