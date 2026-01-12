@@ -152,7 +152,7 @@ The GPIO pins on the Raspberry Pi will connect to the pins on your L298N Motor C
 
 **ENB** is also sometimes labeled as **ENB**, **EN B**, **EB**, **PWM_B**, **PWMB**, **EN2**, **ENABLE_B**
 
-### Connect the following pins on the motor controller to the folowing pins on the Raspberry Pi:
+### 2.1 Connect the following pins on the motor controller to the folowing pins on the Raspberry Pi:
 
 **ENA** to **GPIO 12** AKA **Pin 32** AKA **PWM0** 
 
