@@ -186,7 +186,13 @@ The GPIO pins connected to the motor controller will be referenced in our code:
 
 <br>
 
-![host-and-port](media/MC_motors_2.jpg)
+![host-and-port](media/MC_motors_2.jpg) 
+
+<br>
+<br>
+<br>
+
+# 4. 
 
 ![host-and-port](media/circuit_all.jpg)
 
@@ -196,9 +202,9 @@ The GPIO pins connected to the motor controller will be referenced in our code:
 <br>
 <br>
 
-# 4. Install required software onto your Raspberry Pi
+# 5. Install required software onto your Raspberry Pi
 
-## 4.1 SSH into your Pi 
+## 5.1 SSH into your Pi 
 <br>
 In the following command, replace **name** with **the name you set for the Pi** when you flashed the Ubuntu image with **Raspberry Pi Imager**, and **replace <host>** with **the host name you set** when you flashed the Ubuntu image with **Raspberry Pi Imager** (DO NOT include the pointed brackets / carrot symbols):
 
@@ -211,7 +217,7 @@ You will be prompted to enter **the password you set for the Pi** when you flash
 
 <br>
 
-## 4.2 Install ROS 2 Jazzy (minimal) on the Pi
+## 5.2 Install ROS 2 Jazzy (minimal) on the Pi
 <br>
 Enter the following commands to prepare your system:
 
@@ -268,7 +274,7 @@ sudo apt install -y python3-rpi.gpio python3-opencv \
 
 <br>
 
-## 4.3 Set Up ROS2 networking between your laptop and your Pi
+## 5.3 Set Up ROS2 networking between your laptop and your Pi
 <br>
 Add these lines to the .bashrc file of both machines (Laptop and Pi):
 
@@ -293,7 +299,7 @@ source ~/.bashrc
 
 <br>
 
-## 4.4 Clone the Robot Legion Teleop package
+## 5.4 Clone the Robot Legion Teleop package
 <br>
 Clone this repository into your Raspberry Pi:
 
@@ -304,7 +310,7 @@ git clone https://github.com/AEmilioDiStefano/ros2_ws_minimal.git ros2_ws
 <br>
 
 
-## 4.5 Enable GPIO Access (One-Time Setup)
+## 5.5 Enable GPIO Access (One-Time Setup)
 <br>
 The motor driver node uses Raspberry Pi GPIO. By default, Linux restricts GPIO hardware access, which will cause this error:
 
@@ -349,11 +355,11 @@ You should see **GPIO** and **crw-rw----** included in the output.
 <br>
 <br>
 
-# 5. Start and control your robot 
+# Start and control your robot 
 
 <br>
 
-### 5.1 Turn on your robot
+### 1. Turn on your robot
 
 **Turn on the power bank** that powers the Raspberry Pi
 
@@ -363,7 +369,7 @@ You should see **GPIO** and **crw-rw----** included in the output.
 
 <br>
 
-### 5.2 Open two different terminals 
+### 2. Open two different terminals 
 
 **Both will stay opened** while you are controlling your robot
 
@@ -404,14 +410,14 @@ source ~/ros2_ws/install/setup.bash
    - Sources **your workspace's setup.bash** from the install directory (this is generated when you **colcon build**)
 <br>
 
-### 5.3 On your Pi, run the motor controller node with the following command:
+### 3. On your Pi, run the motor controller node with the following command:
 
 
 ```shell
 ros2 run robot_legion_teleop_python motor_driver_node
 ```
 
-### 5.4 On your laptop, run the teleop node to control your robot:
+### 4. On your laptop, run the teleop node to control your robot:
 
 ```shell
 ros2 run robot_legion_teleop_python legion_teleop_key
@@ -421,6 +427,25 @@ ros2 run robot_legion_teleop_python legion_teleop_key
 <br>
 <br>
 
+### 5. Play hide-and-seek with your cat 
 
+<br> 
+
+**Make sure the terminal running the teleop node is selected** (click anywhere inside the terminal itself)
+
+<br>
+
+<br>
+
+Use the arrow keys for direction and the spacebar to stop.  You can also use your numpad with numlock on as follows:
+ ____________ ____________ ___________
+| 7         || 8         || 9         |
+|  CIRCLE   ||  FORWARD  ||  CIRCLE   |
+|   LEFT    ||           ||   RIGHT   |
+|___________||___________||___________|
+
+![host-and-port](media/hide-and-seek-GIF.gif) 
+
+<br>
 
 
