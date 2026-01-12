@@ -383,7 +383,7 @@ cd ros2_ws
 
 <br>
 
-**In both terminals**, enter the  run the following command:
+**In both terminals**, enter the following command:
 
 ```shell
 unset ROS_LOCALHOST_ONLY
@@ -392,6 +392,12 @@ source /opt/ros/jazzy/setup.bash
 source ~/ros2_ws/install/setup.bash
 ```
 
+**What this does:** 
+
+   - Ensures that **the ROS2_LOCALHOST_ONLY environment variable is not set** (otherwise all ROS 2 communications are restricted to the local loopback interface)
+   - Puts both the **laptop and the robot on the same ROS2_localhost_domain** (otherwise the machines will not be able to communicate)
+   - Sources **Jazzy's setup.bash** file
+   - Sources **your workspace's setup.bash** from install (this is generated when you **colcon build**)
 <br>
 
 ### 5.3 On your Pi, run the motor controller node with the following command:
