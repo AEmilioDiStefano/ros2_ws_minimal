@@ -359,7 +359,7 @@ You should see **GPIO** and **crw-rw----** included in the output.
 
 <br>
 
-## 1. Turn on your robot
+## 1. Power up your robot
 
 **Turn on the power bank** that powers the Raspberry Pi
 
