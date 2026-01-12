@@ -438,11 +438,12 @@ ros2 run robot_legion_teleop_python legion_teleop_key
 <br>
 
 Use the arrow keys for direction and the spacebar to stop.  You can also use your numpad with numlock on as follows:
- ____________ ____________ ___________   
-| 7\\\\\\\\\|| 8\\\\\\\\\|| 9\\\\\\\\\|  
-|//CIRCLE   ||  FORWARD  ||  CIRCLE   |  
-|   LEFT    ||           ||   RIGHT   |  
-|___________||___________||___________|  
+ ______________ ______________ _____________   
+| 7\ \ \ \ \ \|| 8\ \ \ \ \ \|| 9\ \ \ \ \ \|  
+| \CIRCLE\ \ \||\ \ \ \ \ \ \||\ \ \CIRCLE\ |  
+|\ \LEFT\ \ \ ||\ \FORWARD\ \||\ \ \RIGHT\ \|
+|\ \FORWARD\ \||\ \ \ \ \ \ \||\ \FORWARD\ \|  
+|_____________||_____________||_____________|  
   
 ![host-and-port](media/hide-and-seek-GIF.gif) 
 
