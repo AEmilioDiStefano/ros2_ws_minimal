@@ -431,21 +431,24 @@ ros2 run robot_legion_teleop_python legion_teleop_key
 
 <br> 
 
-**Make sure the terminal running the teleop node is selected** (click anywhere inside the terminal itself)
-
-<br>
-
-<br>
-
-Use the arrow keys for direction and the spacebar to stop.  You can also use your numpad with numlock on as follows:
- ______________ ______________ _____________   
-| 7\ \ \ \ \ \|| 8\ \ \ \ \ \|| 9\ \ \ \ \ \|  
-| \CIRCLE\ \ \||\ \ \ \ \ \ \||\ \ \CIRCLE\ |  
-|\ \LEFT\ \ \ ||\ \FORWARD\ \||\ \ \RIGHT\ \|
-|\ \FORWARD\ \||\ \ \ \ \ \ \||\ \FORWARD\ \|  
-|_____________||_____________||_____________|  
-  
 ![host-and-port](media/hide-and-seek-GIF.gif) 
+<br>
+**Make sure the terminal running the teleop node is selected** (click anywhere inside the terminal itself)
+<br>
+Use the arrow keys for direction and the spacebar to stop.  You can also use your **numpad with numlock** on as follows:
+
+**8** to **GO FORWARD**  
+**2** to **GO BACKWARD**  
+**4** to **ROTATE LEFT**  
+**6** to **ROTATE RIGHT**  
+
+**7** to **CIRCLE LEFT FORWARD**  
+**9** to **CIECLE RIGHT FORWARD**  
+**1** to **CIRCLE LEFT BACKWARD**  
+**3** to **CIRCLE RIGHT BACKWARD**  
+
+**5** to **STOP**  
+
 
 <br>
 
