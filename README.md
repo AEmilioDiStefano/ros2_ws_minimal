@@ -439,7 +439,7 @@ ros2 run robot_legion_teleop_python legion_teleop_key
 
 <br>
 
-Use the arrow keys for direction and the spacebar to stop.  You can also use your **numpad with numlock** on as follows:
+**Use the arrow keys for direction** and the spacebar to stop.  You can also use your **numpad with numlock** on to control as follows:
 
 **8** to **GO FORWARD**  
 **2** to **GO BACKWARD**  
