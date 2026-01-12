@@ -359,7 +359,7 @@ You should see **GPIO** and **crw-rw----** included in the output.
 
 <br>
 
-### 1. Turn on your robot
+## 1. Turn on your robot
 
 **Turn on the power bank** that powers the Raspberry Pi
 
@@ -369,17 +369,11 @@ You should see **GPIO** and **crw-rw----** included in the output.
 
 <br>
 
-### 2. Open two different terminals 
+## 2. Open two different terminals 
 
 **Both will stay opened** while you are controlling your robot
 
 **In one terminal**, SSH into your robot's Raspberry Pi
-
-**If you have not already done so**, clone **the minimal version of the ros2_ws workspace** into your Pi:
-
-```shell
-git clone https://github.com/AEmilioDiStefano/ros2_ws_minimal.git ros2_ws
-```
 
 **Now enter the newly cloned ros2_ws directory**:
 
@@ -387,7 +381,15 @@ git clone https://github.com/AEmilioDiStefano/ros2_ws_minimal.git ros2_ws
 cd ros2_ws
 ```
 
-**The other terminal (on your laptop)**, enter your existing ros2_ws directory:
+**IF YOU DO NOT HAVE THIS DIRECTORY**, clone **the minimal version of the ros2_ws workspace** onto your Pi:
+
+```shell
+git clone https://github.com/AEmilioDiStefano/ros2_ws_minimal.git ros2_ws
+```
+
+
+
+**In the other terminal (on your laptop)**, enter your existing ros2_ws directory:
 
 ```shell
 cd ros2_ws
@@ -412,7 +414,7 @@ source ~/ros2_ws/install/setup.bash
    - Sources **your workspace's setup.bash** from the install directory (this is generated when you **colcon build**)
 <br>
 
-### 3. On your Pi, run the motor controller node with the following command:
+## 3. On your Pi, run the motor controller node with the following command:
 
 
 ```shell
@@ -423,7 +425,7 @@ ros2 run robot_legion_teleop_python motor_driver_node
 <br>
 <br>
 
-### 4. On your laptop, run the teleop node to control your robot:
+## 4. On your laptop, run the teleop node to control your robot:
 
 ```shell
 ros2 run robot_legion_teleop_python legion_teleop_key
@@ -433,7 +435,7 @@ ros2 run robot_legion_teleop_python legion_teleop_key
 <br>
 <br>
 
-### 5. Play hide-and-seek with your cat 
+## 5. Play hide-and-seek with your cat 
 
 <br> 
 
