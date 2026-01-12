@@ -1,4 +1,4 @@
-This is the minimal version of **AEmilioDistefano's ros2_ws repository**.  This version **does not include any virtualization** and **only includes what is necvessary control your robot(s) in the real world**.
+This is the minimal version of **AEmilioDistefano's ros2_ws repository**.  This version **does not include any virtualization** and **only includes what is necessary control your robot(s) in the real world**.
 
 When cloning onto a Raspberry Pi, **always clone this repository rather than the full version of the ros2_ws repository**.
 
