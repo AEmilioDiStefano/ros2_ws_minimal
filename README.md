@@ -432,9 +432,13 @@ ros2 run robot_legion_teleop_python legion_teleop_key
 <br> 
 
 ![host-and-port](media/hide-and-seek-GIF.gif) 
+
 <br>
+
 **Make sure the terminal running the teleop node is selected** (click anywhere inside the terminal itself)
+
 <br>
+
 Use the arrow keys for direction and the spacebar to stop.  You can also use your **numpad with numlock** on as follows:
 
 **8** to **GO FORWARD**  
@@ -448,7 +452,6 @@ Use the arrow keys for direction and the spacebar to stop.  You can also use you
 **3** to **CIRCLE RIGHT BACKWARD**  
 
 **5** to **STOP**  
-
 
 <br>
 
