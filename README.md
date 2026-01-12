@@ -417,6 +417,10 @@ source ~/ros2_ws/install/setup.bash
 ros2 run robot_legion_teleop_python motor_driver_node
 ```
 
+<br>
+<br>
+<br>
+
 ### 4. On your laptop, run the teleop node to control your robot:
 
 ```shell
