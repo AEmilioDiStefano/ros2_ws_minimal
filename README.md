@@ -182,10 +182,9 @@ The GPIO pins connected to the motor controller will be referenced in our code:
 
 # 3. Connect your motors to your motor controller 
 
-## 3.1 
+## 3.1 Take eight of your male-to-female (or male-to-male) jumper cables and perform the following connections:
 
 <br>
-Take eight of your male-to-female (or male-to-male) jumper cables and perform the following connections:
 
 ![host-and-port](media/MC_motors_2.jpg)
 
