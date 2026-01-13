@@ -261,6 +261,8 @@ Now add sourcing to your .bashrc file on the Pi:
 echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc
 source ~/.bashrc
 
+```shell
+echo "export ROS_NAMESPACE='/$HOSTNAME'"
 ```
 
 Add some packages for GPIO control, camera and CV bridge, and other tools:
