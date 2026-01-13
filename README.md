@@ -263,7 +263,7 @@ source ~/.bashrc
 ```
 
 ```shell
-echo "export ROS_NAMESPACE='/$HOSTNAME'" >> ~/.bashrc
+echo 'export ROS_NAMESPACE="/$HOSTNAME"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
