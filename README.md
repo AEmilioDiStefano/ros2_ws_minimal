@@ -418,7 +418,7 @@ sudo apt install -y ros-jazzy-v4l2-camera
 
 **Switch on** the 'ON' switch for your motors and motor controller.
 
-** Wait about 120 seconds** for the Pi to get online
+**Wait about 120 seconds** for the Pi to get online
 
 <br>
 
