@@ -7,8 +7,14 @@ setup(
     version="0.1.0",
     packages=[package_name],
     data_files=[
+        # Required for ROS package indexing
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
+
+        # Package manifest
         ("share/" + package_name, ["package.xml"]),
+
+        # Launch files
+        ("share/" + package_name + "/launch", ["launch/robot_bringup.launch.py"]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -25,10 +31,10 @@ setup(
             # Motor driver
             "motor_driver_node = robot_legion_teleop_python.motor_driver_node:main",
 
-            # Lock manager (NEW)
+            # Lock manager
             "control_lock_manager = robot_legion_teleop_python.control_lock_manager:main",
 
-            # FPV WebRTC UI (if you have fpv_web_server.py in this package)
+            # FPV WebRTC UI
             "fpv_web_server = robot_legion_teleop_python.fpv_web_server:main",
 
             # Gazebo reset utility
