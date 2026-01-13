@@ -349,10 +349,48 @@ EOF
 
 ```shell
 ls -l /dev/gpiomem
-
 ```
 
 You should see **GPIO** and **crw-rw----** included in the output.
+
+<br>
+<br>
+<br>
+
+# 6 Setup your venv python environment and install dependencies (do this BOTH on your laptop AND on the Pi)
+
+```shell
+sudo apt update
+
+# venv tooling
+sudo apt install -y python3-full python3-venv
+
+# WebRTC/aiortc runtime helpers (safe + commonly needed)
+sudo apt install -y ffmpeg
+
+# If pip ends up compiling wheels (sometimes happens), these help:
+sudo apt install -y pkg-config build-essential \
+  libsrtp2-dev libssl-dev \
+  libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
+  libswresample-dev libswscale-dev
+```
+
+```shell
+cd /home/aemilio/ros2_ws
+
+python3 -m venv --system-site-packages .venv_ros
+source .venv_ros/bin/activate
+
+python -m pip install --upgrade pip
+```
+
+```shell
+pip install aiohttp aiortc av pillow numpy
+```
+
+```shell
+sudo apt install -y ros-jazzy-v4l2-camera
+```
 
 <br>
 <br>
