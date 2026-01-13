@@ -192,7 +192,7 @@ The GPIO pins connected to the motor controller will be referenced in our code:
 <br>
 <br>
 
-# 4. 
+# 4. Complete the circuit
 
 ![host-and-port](media/circuit_all.jpg)
 
