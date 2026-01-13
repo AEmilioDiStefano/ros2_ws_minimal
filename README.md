@@ -260,9 +260,11 @@ Now add sourcing to your .bashrc file on the Pi:
 ```shell
 echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc
 source ~/.bashrc
+```
 
 ```shell
-echo "export ROS_NAMESPACE='/$HOSTNAME'"
+echo "export ROS_NAMESPACE='/$HOSTNAME'" >> ~/.bashrc
+source ~/.bashrc
 ```
 
 Add some packages for GPIO control, camera and CV bridge, and other tools:
@@ -271,7 +273,6 @@ Add some packages for GPIO control, camera and CV bridge, and other tools:
 sudo apt install -y python3-rpi.gpio python3-opencv \
   ros-jazzy-cv-bridge ros-jazzy-image-transport \
   ros-jazzy-geometry-msgs ros-jazzy-sensor-msgs ros-jazzy-std-msgs
-
 ```
 
 <br>
