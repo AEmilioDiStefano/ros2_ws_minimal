@@ -36,15 +36,6 @@ Terminal reliability note:
 - Printing while RAW is active can cause newline behavior that "drifts" output rightward
   (because \n may not return to column 0).
 - We fix that by ALWAYS printing in cooked mode, then returning to raw.
-
-NEW (minimal additions):
-- Teleop respects the shared per-robot control lock.
-  Teleop will only publish cmd_vel if it owns the lock for the active robot.
-
-Lock protocol (std_msgs/String JSON):
-  /control_lock/request
-  /control_lock/state
-  /control_lock/response/<client_id>
 """
 
 import re
@@ -53,9 +44,6 @@ import select
 import termios
 import tty
 import time
-import json
-import os
-import socket
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -91,96 +79,6 @@ def read_key_raw(timeout_s: float = 0.1) -> str:
     return key
 
 
-def _make_client_id() -> str:
-    host = socket.gethostname().strip() or "host"
-    # ROS topic name-safe: only alphanumerics and underscores
-    host = re.sub(r"[^A-Za-z0-9_]", "_", host)
-
-    pid = os.getpid()
-    return f"teleop_{host}_{pid}"
-
-class LockClient:
-    """
-    Minimal lock client to share the same lock as the browser UI.
-    Topic JSON over std_msgs/String.
-
-    Request: /control_lock/request
-      {"action":"acquire|release|heartbeat","robot":"robotname","client_id":"..."}
-    State: /control_lock/state
-      {"locks": {"robotname": "owner_client_id", ...}}
-    Response: /control_lock/response/<client_id>
-      {"ok": true|false, "action":"...", "robot":"...", "owner":"...", "reason":"..."}
-    """
-    def __init__(self, node: Node, client_id: str):
-        self.node = node
-        self.client_id = client_id
-
-        self.req_pub = node.create_publisher(String, "/control_lock/request", 50)
-
-        self._locks: Dict[str, str] = {}
-        self._last_resp: Optional[Dict] = None
-
-        self._state_sub = node.create_subscription(String, "/control_lock/state", self._on_state, 10)
-        self._resp_sub = node.create_subscription(
-            String,
-            f"/control_lock/response/{client_id}",
-            self._on_resp,
-            10,
-        )
-
-    def _on_state(self, msg: String):
-        try:
-            data = json.loads(msg.data)
-            self._locks = dict(data.get("locks") or {})
-        except Exception:
-            self._locks = {}
-
-    def _on_resp(self, msg: String):
-        try:
-            self._last_resp = json.loads(msg.data)
-        except Exception:
-            self._last_resp = None
-
-    def owner(self, robot: str) -> Optional[str]:
-        return self._locks.get(robot)
-
-    def _publish_req(self, action: str, robot: str):
-        m = String()
-        m.data = json.dumps({"action": action, "robot": robot, "client_id": self.client_id})
-        self.req_pub.publish(m)
-
-    def acquire(self, robot: str, timeout_sec: float = 1.0) -> bool:
-        self._last_resp = None
-        self._publish_req("acquire", robot)
-        t0 = time.time()
-        while (time.time() - t0) < timeout_sec:
-            rclpy.spin_once(self.node, timeout_sec=0.05)
-            if (
-                self._last_resp
-                and self._last_resp.get("action") == "acquire"
-                and self._last_resp.get("robot") == robot
-            ):
-                return bool(self._last_resp.get("ok"))
-        return False
-
-    def release(self, robot: str, timeout_sec: float = 1.0) -> bool:
-        self._last_resp = None
-        self._publish_req("release", robot)
-        t0 = time.time()
-        while (time.time() - t0) < timeout_sec:
-            rclpy.spin_once(self.node, timeout_sec=0.05)
-            if (
-                self._last_resp
-                and self._last_resp.get("action") == "release"
-                and self._last_resp.get("robot") == robot
-            ):
-                return bool(self._last_resp.get("ok"))
-        return False
-
-    def heartbeat(self, robot: str):
-        self._publish_req("heartbeat", robot)
-
-
 @dataclass
 class TeleopState:
     available_robots: List[str]
@@ -212,13 +110,6 @@ class RobotLegionTeleop(Node):
         self.publisher_ = None
         self.cmd_vel_topic: Optional[str] = None
         self.current_robot_name: Optional[str] = None
-
-        # --- NEW: lock client (minimal addition) ---
-        self.lock_client_id = _make_client_id()
-        self.lock = LockClient(self, self.lock_client_id)
-        self.lock_owned_for_active_robot: bool = False
-        self.create_timer(1.0, self._lock_heartbeat_timer)
-        # ------------------------------------------
 
         # Speed profile
         self.linear_speed = 0.5
@@ -283,46 +174,6 @@ class RobotLegionTeleop(Node):
         # Initial UI
         self._tprint(self.render_instructions(topic_name=None))
         self._tprint("[STARTUP] Discovering robots...")
-        self._tprint(f"[LOCK] teleop lock_client_id: {self.lock_client_id}")
-
-    # ---------------- NEW: lock helpers (minimal addition) ----------------
-
-    def _lock_heartbeat_timer(self):
-        if self.current_robot_name and self.lock_owned_for_active_robot:
-            if self.lock.owner(self.current_robot_name) == self.lock_client_id:
-                self.lock.heartbeat(self.current_robot_name)
-            else:
-                # lock expired or taken elsewhere
-                self.lock_owned_for_active_robot = False
-                self.is_moving = False
-                self.last_lin_mult = 0.0
-                self.last_ang_mult = 0.0
-                self.last_twist = Twist()
-                self._tprint(f"[LOCK] Lost lock for '{self.current_robot_name}'. Teleop motion disabled until lock reacquired.")
-
-    def _release_lock_if_owned(self):
-        if not self.current_robot_name:
-            self.lock_owned_for_active_robot = False
-            return
-        if self.lock.owner(self.current_robot_name) == self.lock_client_id:
-            self.lock.release(self.current_robot_name)
-        self.lock_owned_for_active_robot = False
-
-    def _try_acquire_lock_for_robot(self, robot: str):
-        self.lock_owned_for_active_robot = False
-        ok = self.lock.acquire(robot)
-        if ok:
-            self.lock_owned_for_active_robot = True
-            self._tprint(f"[LOCK] Acquired lock for '{robot}'.")
-        else:
-            owner = self.lock.owner(robot)
-            self._tprint(f"[LOCK] Lock denied for '{robot}'. Current owner: {owner or '(unknown)'}")
-            self._tprint("[LOCK] Active robot still switches (for video), but teleop motion is DISABLED for this robot.")
-
-    def _can_publish_cmd(self) -> bool:
-        if self.publisher_ is None or not self.current_robot_name:
-            return False
-        return self.lock_owned_for_active_robot and (self.lock.owner(self.current_robot_name) == self.lock_client_id)
 
     # ---------------- Terminal output (cooked mode only) ----------------
 
@@ -423,13 +274,6 @@ class RobotLegionTeleop(Node):
         if self.current_robot_name:
             lines.append("")
             lines.append(f"ACTIVE ROBOT: {self.current_robot_name}")
-            # NEW: small lock status display
-            owner = self.lock.owner(self.current_robot_name)
-            if owner:
-                lines.append(f"LOCK OWNER: {owner}")
-            else:
-                lines.append("LOCK OWNER: (none)")
-            lines.append(f"TELEOP LOCK HELD: {self.lock_owned_for_active_robot}")
         lines.append("")
         lines.append("MOVEMENT:")
         lines.append("  8 forward")
@@ -491,11 +335,7 @@ class RobotLegionTeleop(Node):
         else:
             lines.append("")
             for r in robots:
-                # NEW: show lock ownership in the list
-                owner = self.lock.owner(r)
                 lines.append(f"  - {r}")
-                if owner:
-                    lines.append(f"    LOCKED by: {owner}")
                 lines.append("")
         lines.append("================================")
         lines.append("")
@@ -552,12 +392,6 @@ class RobotLegionTeleop(Node):
             self._tprint("[ERROR] Refusing to use /cmd_vel. Use /<robot>/cmd_vel for multi-robot architecture.")
             return
 
-        # NEW: release lock for previous robot if we owned it
-        prev_robot = self.current_robot_name
-        if prev_robot and (self.lock.owner(prev_robot) == self.lock_client_id):
-            self.lock.release(prev_robot)
-        self.lock_owned_for_active_robot = False
-
         robot = self._topic_to_robot(new_topic)
         if robot:
             self.current_robot_name = robot
@@ -571,13 +405,7 @@ class RobotLegionTeleop(Node):
         self.publisher_ = self.create_publisher(Twist, new_topic, 10)
         self.cmd_vel_topic = new_topic
 
-        # Always publish active robot (so video can follow selection even if lock denied)
         self._publish_active_robot()
-
-        # NEW: attempt to acquire lock for the selected robot
-        if self.current_robot_name:
-            self._try_acquire_lock_for_robot(self.current_robot_name)
-
         self._tprint(self.render_instructions(new_topic))
         self._tprint(f"[ACTIVE ROBOT] Now controlling: {self.current_robot_name}")
 
@@ -594,9 +422,6 @@ class RobotLegionTeleop(Node):
             v = (v_left + v_right)/2
             w = (v_right - v_left)/L
         """
-        if not self._can_publish_cmd():
-            return
-
         L = self.wheel_separation if self.wheel_separation > 1e-6 else 0.18
         v = 0.5 * (v_left + v_right)
         w = (v_right - v_left) / L
@@ -614,10 +439,6 @@ class RobotLegionTeleop(Node):
 
     def _republish_last_twist(self):
         if not self.is_moving or self.publisher_ is None:
-            return
-
-        # NEW: respect lock
-        if not self._can_publish_cmd():
             return
 
         if abs(self.last_twist.linear.x) > 1e-9 or abs(self.last_twist.angular.z) > 1e-9:
@@ -649,14 +470,9 @@ class RobotLegionTeleop(Node):
         self._tprint(f"[OFFLINE] Robot '{self.current_robot_name}' appears offline (no subscribers on {self.cmd_vel_topic}).")
         self._tprint("[OFFLINE] Stopping and returning to robot selection.")
         try:
-            # NEW: only publish stop if we own lock
-            if self._can_publish_cmd():
-                self.publisher_.publish(Twist())
+            self.publisher_.publish(Twist())
         except Exception:
             pass
-
-        # NEW: release lock if owned
-        self._release_lock_if_owned()
 
         self.is_moving = False
         self.last_lin_mult = 0.0
@@ -787,11 +603,6 @@ class RobotLegionTeleop(Node):
 
                 # Movement keys
                 if key in self.move_bindings:
-                    # NEW: respect lock (ignore motion if we don't own it)
-                    if not self._can_publish_cmd():
-                        self.is_moving = False
-                        continue
-
                     mode, lin_mult, ang_mult = self.move_bindings[key]
 
                     if mode == "circle":
@@ -821,9 +632,7 @@ class RobotLegionTeleop(Node):
 
                 # Stop
                 if key in (" ", "5", "s"):
-                    # NEW: only publish stop if we own lock; always clear local state
-                    if self._can_publish_cmd():
-                        self.publisher_.publish(Twist())
+                    self.publisher_.publish(Twist())
                     self.is_moving = False
                     self.last_lin_mult = 0.0
                     self.last_ang_mult = 0.0
@@ -833,14 +642,6 @@ class RobotLegionTeleop(Node):
 
                 # Switch robot
                 if key == "m":
-                    # NEW: publish stop only if we own lock (optional but safe)
-                    if self._can_publish_cmd():
-                        self.publisher_.publish(Twist())
-                    self.is_moving = False
-                    self.last_lin_mult = 0.0
-                    self.last_ang_mult = 0.0
-                    self.last_twist = Twist()
-
                     self._prompt_until_valid_robot()
                     continue
 
@@ -852,15 +653,9 @@ class RobotLegionTeleop(Node):
         finally:
             try:
                 if self.publisher_ is not None:
-                    # NEW: stop only if we own lock
-                    if self._can_publish_cmd():
-                        self.publisher_.publish(Twist())
+                    self.publisher_.publish(Twist())
             except Exception:
                 pass
-
-            # NEW: release lock if owned
-            self._release_lock_if_owned()
-
             restore_terminal_settings(self._terminal_settings)
 
 
