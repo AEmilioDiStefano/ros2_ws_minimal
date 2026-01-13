@@ -357,10 +357,10 @@ You should see **GPIO** and **crw-rw----** included in the output.
 <br>
 <br>
 
-# 6. Setup your venv python environment and install dependencies (do this BOTH on your laptop AND on the Pi)
+# 6. Setup your venv python environment and install dependencies
 
 
-## 6.1 Use a venv with --system-site-packages
+## 6.1 Use a venv with --system-site-packages ( ONLY ON THE LAPTOP )
 
 <br>
 
@@ -381,7 +381,7 @@ sudo apt install -y pkg-config build-essential \
   libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
   libswresample-dev libswscale-dev
 ```
-## 6.2 Create the venv in your workspace root
+## 6.2 Create the venv in your workspace root ( ONLY ON THE LAPTOP )
 
 ```shell
 cd /home/aemilio/ros2_ws
@@ -392,13 +392,13 @@ source .venv_ros/bin/activate
 python -m pip install --upgrade pip
 ```
 
-## 6.3 Install Python dependencies inside the venv
+## 6.3 Install Python dependencies inside the venv ( ONLY ON THE LAPTOP )
 
 ```shell
 pip install aiohttp aiortc av pillow numpy
 ```
 
-## 6.4 Install ROS camera dependencies so that so /ROBOT/image_raw exists
+## 6.4 Install ROS camera dependencies so that so /ROBOT/image_raw exists ( ONLY ON THE Pi(s) )
 
 ```shell
 sudo apt install -y ros-jazzy-v4l2-camera
