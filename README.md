@@ -398,6 +398,8 @@ python -m pip install --upgrade pip
 pip install aiohttp aiortc av pillow numpy
 ```
 
+## 6.4 Install the dependencies
+
 ```shell
 sudo apt install -y ros-jazzy-v4l2-camera
 ```
