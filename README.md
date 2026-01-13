@@ -396,11 +396,11 @@ sudo apt install -y ros-jazzy-v4l2-camera
 <br>
 <br>
 
-# Start and control your robot 
+# 7. Start and control your robot 
 
 <br>
 
-## 1. Power up your robot
+## 7.1 Power up your robot
 
 **Turn on the power bank** that powers the Raspberry Pi
 
@@ -410,7 +410,7 @@ sudo apt install -y ros-jazzy-v4l2-camera
 
 <br>
 
-## 2. Open two different terminals 
+## 7.2 Open two different terminals 
 
 **Both will stay opened** while you are controlling your robot
 
@@ -455,7 +455,7 @@ source ~/ros2_ws/install/setup.bash
    - Sources **your workspace's setup.bash** from the install directory (this is generated when you **colcon build**)
 <br>
 
-## 3. On your Pi, run the motor controller node with the following command:
+## 7.3 On your Pi, run the motor controller node with the following command:
 
 
 ```shell
@@ -466,7 +466,7 @@ ros2 run robot_legion_teleop_python motor_driver_node
 <br>
 <br>
 
-## 4. On your laptop, run the teleop node to control your robot:
+## 7.4 On your laptop, run the teleop node to control your robot:
 
 ```shell
 ros2 run robot_legion_teleop_python legion_teleop_key
@@ -476,7 +476,7 @@ ros2 run robot_legion_teleop_python legion_teleop_key
 <br>
 <br>
 
-## 5. Play hide-and-seek with your cat 
+## 7.5 Play hide-and-seek with your cat 
 
 <br> 
 
