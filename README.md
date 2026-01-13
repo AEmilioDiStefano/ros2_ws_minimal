@@ -357,7 +357,7 @@ You should see **GPIO** and **crw-rw----** included in the output.
 <br>
 <br>
 
-# 6 Setup your venv python environment and install dependencies (do this BOTH on your laptop AND on the Pi)
+# 6. Setup your venv python environment and install dependencies (do this BOTH on your laptop AND on the Pi)
 
 ```shell
 sudo apt update
