@@ -398,7 +398,7 @@ python -m pip install --upgrade pip
 pip install aiohttp aiortc av pillow numpy
 ```
 
-## 6.4 Install ROS camera dependencies so that so /ROBOT/image_raw exists (ONLY ON THE Pi(s))
+## 6.4 Install ROS camera dependencies (ONLY ON THE Pi(s))
 
 ```shell
 sudo apt install -y ros-jazzy-v4l2-camera
