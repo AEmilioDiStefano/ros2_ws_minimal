@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import time
-import getpass
+import socket
 
 import rclpy
 from rclpy.node import Node
@@ -13,13 +13,27 @@ except ImportError:
     GPIO_AVAILABLE = False
 
 
+def _default_robot_name() -> str:
+    """
+    Use hostname by default so each robot naturally gets a unique /<robot>/cmd_vel.
+    This avoids hard-coding names in launch commands and prevents multi-robot topic collisions.
+    """
+    try:
+        name = socket.gethostname().strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    return "robot1"
+
+
 class MotorDriverNode(Node):
     def __init__(self):
         super().__init__("motor_driver_node")
 
         # Robot naming
-        self.declare_parameter("robot_name", getpass.getuser())
-        self.robot_name = self.get_parameter("robot_name").value.strip() or getpass.getuser()
+        self.declare_parameter("robot_name", _default_robot_name())
+        self.robot_name = str(self.get_parameter("robot_name").value).strip() or _default_robot_name()
 
         # Parameters
         self.declare_parameter("wheel_separation", 0.18)   # meters
@@ -29,7 +43,7 @@ class MotorDriverNode(Node):
 
         # Topic this robot listens to
         self.declare_parameter("cmd_vel_topic", f"/{self.robot_name}/cmd_vel")
-        self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value.strip() or f"/{self.robot_name}/cmd_vel"
+        self.cmd_vel_topic = str(self.get_parameter("cmd_vel_topic").value).strip() or f"/{self.robot_name}/cmd_vel"
 
         # GPIO pins (BCM)
         self.EN_A = 12

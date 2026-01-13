@@ -14,20 +14,25 @@ setup(
     zip_safe=True,
     maintainer="Vitruvian Systems LLC",
     maintainer_email="emilio@vitruvian.systems",
-    description="Keyboard teleop, motor driver, camera node, and FPV mux for Robot Legion robots.",
+    description="Keyboard teleop, motor driver, and FPV web UI for Robot Legion robots.",
     license="CC-BY-NC-4.0",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            # Teleop (keyboard)
+            # Teleop
             "legion_teleop_key = robot_legion_teleop_python.teleop_legion_key:main",
 
-            # Real robot motor driver (L298N + yellow motors)
+            # Motor driver
             "motor_driver_node = robot_legion_teleop_python.motor_driver_node:main",
+
+            # Lock manager (NEW)
+            "control_lock_manager = robot_legion_teleop_python.control_lock_manager:main",
+
+            # FPV WebRTC UI (if you have fpv_web_server.py in this package)
+            "fpv_web_server = robot_legion_teleop_python.fpv_web_server:main",
 
             # Gazebo reset utility
             "reset_gz = robot_legion_teleop_python.reset_gz:main",
-
         ],
     },
 )
