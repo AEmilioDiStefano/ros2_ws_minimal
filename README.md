@@ -359,6 +359,13 @@ You should see **GPIO** and **crw-rw----** included in the output.
 
 # 6. Setup your venv python environment and install dependencies (do this BOTH on your laptop AND on the Pi)
 
+
+## 6.1 Use a venv with --system-site-packages
+
+<br>
+
+** This way the venv can still see ROS’s rclpy and message packages** while you pip-install WebRTC deps safely
+
 ```shell
 sudo apt update
 
@@ -374,6 +381,7 @@ sudo apt install -y pkg-config build-essential \
   libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
   libswresample-dev libswscale-dev
 ```
+## 6.2 Create the venv in your workspace root
 
 ```shell
 cd /home/aemilio/ros2_ws
@@ -383,6 +391,8 @@ source .venv_ros/bin/activate
 
 python -m pip install --upgrade pip
 ```
+
+## 6.3 Install Python dependencies inside the venv
 
 ```shell
 pip install aiohttp aiortc av pillow numpy
