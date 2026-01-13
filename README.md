@@ -485,8 +485,6 @@ ros2 run robot_legion_teleop_python legion_teleop_key
 ```
 
 <br>
-<br>
-<br>
 
 ## 7.5 Play hide-and-seek with your cat 
 
