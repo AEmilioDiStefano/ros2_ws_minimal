@@ -357,48 +357,16 @@ You should see **GPIO** and **crw-rw----** included in the output.
 <br>
 <br>
 
-# 6. Setup your venv python environment and install dependencies
+# 6. Install additional dependencies
 
 
-## 6.1 Use a venv with --system-site-packages (ONLY ON THE LAPTOP)
-
-<br>
-
-** This way the venv can still see ROS’s rclpy and message packages** while you pip-install WebRTC deps safely
+## 6.1 Install aiohttp
 
 ```shell
-sudo apt update
-
-# venv tooling
-sudo apt install -y python3-full python3-venv
-
-# WebRTC/aiortc runtime helpers (safe + commonly needed)
-sudo apt install -y ffmpeg
-
-# If pip ends up compiling wheels (sometimes happens), these help:
-sudo apt install -y pkg-config build-essential \
-  libsrtp2-dev libssl-dev \
-  libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
-  libswresample-dev libswscale-dev
-```
-## 6.2 Create the venv in your workspace root (ONLY ON THE LAPTOP)
-
-```shell
-cd /home/aemilio/ros2_ws
-
-python3 -m venv --system-site-packages .venv_ros
-source .venv_ros/bin/activate
-
-python -m pip install --upgrade pip
+pip install aiohttp
 ```
 
-## 6.3 Install Python dependencies inside the venv (ONLY ON THE LAPTOP)
-
-```shell
-pip install aiohttp aiortc av pillow numpy
-```
-
-## 6.4 Install ROS camera dependencies (ONLY ON THE Pi(s))
+## 6.2 Install ROS camera dependencies (ONLY ON THE Pi(s))
 
 ```shell
 sudo apt install -y ros-jazzy-v4l2-camera
