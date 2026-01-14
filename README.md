@@ -369,7 +369,15 @@ sudo apt install -y \
   ros-${ROS_DISTRO}-web-video-server
 ```
 
-## 6.2 Install ROS camera dependencies (ONLY ON THE Pi(s))
+## 6.2 Get roslib locally (on the laptop)
+
+```shell
+sudo apt update
+sudo apt install -y curl
+curl -L -o roslib.min.js https://raw.githubusercontent.com/RobotWebTools/roslibjs/develop/build/roslib.min.js
+```
+
+## 6.3 Install ROS camera dependencies (ONLY ON THE Pi(s))
 
 ```shell
 sudo apt install -y ros-jazzy-v4l2-camera
