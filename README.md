@@ -360,10 +360,13 @@ You should see **GPIO** and **crw-rw----** included in the output.
 # 6. Install additional dependencies
 
 
-## 6.1 Install aiohttp
+## 6.1 Install ROS-native web gateway packages (on the laptop AND the Pi)
 
 ```shell
-pip install aiohttp
+sudo apt update
+sudo apt install -y \
+  ros-${ROS_DISTRO}-rosbridge-server \
+  ros-${ROS_DISTRO}-web-video-server
 ```
 
 ## 6.2 Install ROS camera dependencies (ONLY ON THE Pi(s))
