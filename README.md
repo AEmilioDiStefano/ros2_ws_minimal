@@ -134,11 +134,11 @@ Almost all of these tools can be replaced with basic household items, but we wil
 
 # 2. Connect your Pi to your motor controller
 
-![host-and-port](media/PI_MC_all_1.jpg)
-
 After **mounting the Pi and the Motor Controller onto the chassis**, it's time to wire everything together.
 
-**FIRST** connect one of the **GND** (ground) pins on your Pi to the **GND** (ground) on your motor controller as depicted above. 
+**FIRST** connect one of the **GND** (ground) pins on your Pi to the **GND** (ground) on your motor controller as depicted below: 
+
+![host-and-port](media/PI_MC_all_1.jpg)
 
 The GPIO pins on the Raspberry Pi will connect to the pins on your L298N Motor Controller.  
 
