@@ -340,13 +340,16 @@ sudo usermod -aG gpio $USER
 
 ```
 
-Reload these new rules and reboot
+Reload these new rules and **reboot**:
 
 ```shell
 sudo tee /etc/udev/rules.d/99-gpiomem.rules >/dev/null <<'EOF'
 KERNEL=="gpiomem", GROUP="gpio", MODE="0660"
 EOF
+```
 
+```shell
+sudo reboot
 ```
 
 **SSH back into your Raspbarry Pi** and confirm the changes
