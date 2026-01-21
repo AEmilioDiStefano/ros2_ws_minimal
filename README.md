@@ -464,7 +464,7 @@ ros2 run robot_legion_teleop_python motor_driver_node
 ## 7.4 On your laptop, run the teleop node to control your robot:
 
 ```shell
-ros2 run robot_legion_teleop_python legion_teleop_key
+ros2 run robot_legion_teleop_python teleop_legion_key
 ```
 
 <br>
