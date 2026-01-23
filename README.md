@@ -36,7 +36,7 @@ You can **use another Pi model**, but the flash SD card **preparation will be sl
 (depicted above is one example of a viable option, your power bank may look different)
 
 
-## ONE fuse holder **with at least one 5W fuse** (can be for car, motorcycle, or other type of machine)
+## ONE fuse holder **with at least one 5 amp fuse** (can be for car, motorcycle, or other type of machine)
 
 ![host-and-port](media/fuse_and_holder_1.jpeg) ![host-and-port](media/fuse_and_holder_2_insertion.jpeg)
 <br>
