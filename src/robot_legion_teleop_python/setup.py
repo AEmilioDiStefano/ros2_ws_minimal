@@ -17,6 +17,10 @@ setup(
 
         # Install web UI assets if you use them
         (os.path.join('share', package_name, 'webui'), glob('robot_legion_teleop_python/webui/*')),
+
+        # Install launch files
+        (os.path.join('share', package_name, 'launch'), glob('robot_legion_teleop_python/launch/*.py')),
+
     ],
     install_requires=['setuptools'],
     zip_safe=True,
