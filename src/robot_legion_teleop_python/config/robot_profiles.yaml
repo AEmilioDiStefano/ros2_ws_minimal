@@ -67,6 +67,11 @@ profiles:
       # Safety watchdog: if cmd_vel stops arriving, stop after this many seconds.
       cmd_timeout_s: 0.50
 
+      pwm_hz: 1000
+      min_pwm_duty: 15.0   # optional; try 0 first, then 10–25 if needed
+      cmd_timeout_s: 0.75  # optional; slightly more forgiving
+
+
     gpio:
       # Example GPIO map for a single H-bridge controlling left and right.
       # You MUST match these to your wiring.
