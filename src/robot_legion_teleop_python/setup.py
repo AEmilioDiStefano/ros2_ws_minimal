@@ -23,6 +23,7 @@ setup(
         "console_scripts": [
             "teleop_legion_key = robot_legion_teleop_python.teleop_legion_key:main",
             "motor_driver_node = robot_legion_teleop_python.motor_driver_node:main",
+            "motor_driver_node_OLD = robot_legion_teleop_python.motor_driver_node_OLD:main",
             "heartbeat_node = robot_legion_teleop_python.heartbeat_node:main",
             "unit_executor_action_server = robot_legion_teleop_python.unit_executor_action_server:main",
             # leave your existing ones if you still use them:
