@@ -37,6 +37,7 @@ from rclpy.node import Node
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
 
 from geometry_msgs.msg import Twist
+import threading
 
 from fleet_orchestrator_interfaces.action import ExecutePlaybook
 
@@ -85,6 +86,9 @@ class UnitExecutor(Node):
             cancel_callback=self.cancel_cb,
         )
 
+        # Active goals mapping: id(goal_handle) -> threading.Event
+        self._active_goals = {}
+
         self.get_logger().info(f"[{self.robot}] UnitExecutor ready")
         self.get_logger().info(f"[{self.robot}] action={self.action_name}")
         self.get_logger().info(f"[{self.robot}] drive_type={self.drive_type} cmd_vel={self.cmd_vel_topic}")
@@ -108,6 +112,13 @@ class UnitExecutor(Node):
         we'd refactor run_timed_twist into a timer-driven state machine.
         For Sprint-1 demos, we keep it simple and accept cancel requests.
         """
+        # Signal the running executor loop (if any) to stop
+        ev = self._active_goals.get(id(goal_handle))
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
         return CancelResponse.ACCEPT
 
     # ---------------- helpers ----------------
@@ -159,6 +170,10 @@ class UnitExecutor(Node):
         def fb(percent: float, text: str):
             self._publish_feedback_safe(goal_handle, feedback, percent, text)
 
+        # Create a stop event so cancel requests can interrupt run_timed_twist
+        stop_event = threading.Event()
+        self._active_goals[id(goal_handle)] = stop_event
+
         # Apply speed scaling
         v = self.v * parsed.speed_scale
         vy = self.vy * parsed.speed_scale
@@ -172,19 +187,19 @@ class UnitExecutor(Node):
         # Implement primitives.
         if cid == "hold":
             plan = TimedTwistPlan(twist=Twist(), duration_s=duration_s, status_text="holding")
-            run_timed_twist(self._publish, fb, plan, rate_hz=10.0, stop_at_end=True)
+            run_timed_twist(self._publish, fb, plan, rate_hz=10.0, stop_at_end=True, stop_event=stop_event)
 
         elif cid == "rotate":
             twist = Twist()
             twist.angular.z = w if direction in ("left", "ccw") else -w
             plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"rotate {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True)
+            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
 
         elif cid == "transit":
             twist = Twist()
             twist.linear.x = -v if direction in ("backward", "back", "-x") else +v
             plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"transit {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True)
+            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
 
         elif cid == "strafe":
             # Safe behavior:
@@ -194,7 +209,7 @@ class UnitExecutor(Node):
             if self.drive_type == "mecanum":
                 twist.linear.y = +vy if direction in ("left", "+y") else -vy
             plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"strafe {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True)
+            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
 
         elif cid == "diagonal":
             twist = Twist()
@@ -208,7 +223,7 @@ class UnitExecutor(Node):
                 else:
                     twist.linear.x, twist.linear.y = -v, -vy
             plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"diagonal {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True)
+            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
 
         elif cid == "turn":
             # "turn" is curved on diff, rotate on mecanum (safe + predictable).

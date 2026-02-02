@@ -1,108 +1,88 @@
-#!/usr/bin/env python3
-# SPDX-L:contentReference[oaicite:19]{index=19}Proprietary
-
-"""
-robot_bringup.launch.py
-
-Robot-side bringup for ONE robot.
-
-Starts:
-  - motor_driver_node (always)
-  - heartbeat_node    (always)
-  - unit_executor_action_server (optional; default true)
-  - fpv_control_arbiter         (optional; default false)
-
-WHY THIS LAUNCH FILE EXISTS
----------------------------
-It ensures every robot in a heterogeneous fleet comes up the same way,
-with differences controlled only by robot_profiles.yaml.
-"""
-
-import os
-
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.conditions import IfCondition
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+import os
+import re
+import getpass
 
-def generate_launch_description() -> LaunchDescription:
-    default_robot_name = os.environ.get("USER", "robot")
 
-    robot_name_arg = DeclareLaunchArgument(
-        "robot_name",
-        default_value=default_robot_name,
-        description="Robot identity name. Default: Linux username.",
+def _sanitize_ros_name(name: str) -> str:
+    # ROS name/topic-safe: alphanumerics + underscore only
+    s = re.sub(r"[^A-Za-z0-9_]", "_", (name or "").strip())
+    s = s.strip("_")
+    return s or "robot1"
+
+
+def _default_robot_name_from_username() -> str:
+    # Linux username (like you requested)
+    try:
+        u = getpass.getuser()
+        if u:
+            return _sanitize_ros_name(u)
+    except Exception:
+        pass
+
+    # Fallback: env var USER
+    u = os.environ.get("USER", "").strip()
+    if u:
+        return _sanitize_ros_name(u)
+
+    return "robot1"
+
+
+def _make_nodes(context, *args, **kwargs):
+    robot_name = _default_robot_name_from_username()
+
+    video_device = LaunchConfiguration("video_device").perform(context)
+    use_camera = LaunchConfiguration("use_camera").perform(context).lower() in ("1", "true", "yes", "on")
+
+    nodes = []
+
+    # Motor driver under /<robot_name>/...
+    nodes.append(
+        Node(
+            package="robot_legion_teleop_python",
+            executable="motor_driver_node",
+            name="motor_driver_node",
+            namespace=robot_name,
+            output="screen",
+            parameters=[
+                {"robot_name": robot_name},
+                {"cmd_vel_topic": f"/{robot_name}/cmd_vel"},
+            ],
+        )
     )
 
-    profiles_path_arg = DeclareLaunchArgument(
-        "profiles_path",
-        default_value="",
-        description=(
-            "Optional explicit path to robot_profiles.yaml. "
-            "If empty, nodes use installed share/<pkg>/config/robot_profiles.yaml."
-        ),
+    # Camera publisher under /<robot_name>/image_raw (USB webcam)
+    if use_camera:
+        nodes.append(
+            Node(
+                package="v4l2_camera",
+                executable="v4l2_camera_node",
+                name="camera",
+                namespace=robot_name,
+                output="screen",
+                parameters=[
+                    {"video_device": video_device},
+                ],
+                # In the namespace, image_raw becomes /<robot_name>/image_raw automatically,
+                # but we keep this explicit for clarity and future node swaps.
+                remappings=[
+                    ("image_raw", "image_raw"),
+                ],
+            )
+        )
+
+    return nodes
+
+
+def generate_launch_description():
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument("video_device", default_value="/dev/video0"),
+            DeclareLaunchArgument("use_camera", default_value="true"),
+            OpaqueFunction(function=_make_nodes),
+        ]
     )
-
-    enable_playbook_arg = DeclareLaunchArgument(
-        "enable_playbook",
-        default_value="true",
-        description="Start unit_executor_action_server (robot-side playbook executor).",
-    )
-
-    enable_fpv_arg = DeclareLaunchArgument(
-        "enable_fpv",
-        default_value="false",
-        description="Start fpv_control_arbiter (robot-side control arbitration).",
-    )
-
-    common_params = [
-        {"robot_name": LaunchConfiguration("robot_name")},
-        {"profiles_path": LaunchConfiguration("profiles_path")},
-    ]
-
-    motor_driver = Node(
-        package="robot_legion_teleop_python",
-        executable="motor_driver_node",
-        name="motor_driver_node",
-        output="screen",
-        parameters=common_params,
-    )
-
-    heartbeat = Node(
-        package="robot_legion_teleop_python",
-        executable="heartbeat_node",
-        name="heartbeat_node",
-        output="screen",
-        parameters=common_params,
-    )
-
-    unit_executor = Node(
-        package="robot_legion_teleop_python",
-        executable="unit_executor_action_server",
-        name="unit_executor_action_server",
-        output="screen",
-        parameters=common_params,
-        condition=IfCondition(LaunchConfiguration("enable_playbook")),
-    )
-
-    fpv_arbiter = Node(
-        package="robot_legion_teleop_python",
-        executable="fpv_control_arbiter",
-        name="fpv_control_arbiter",
-        output="screen",
-        parameters=common_params,
-        condition=IfCondition(LaunchConfiguration("enable_fpv")),
-    )
-
-    return LaunchDescription([
-        robot_name_arg,
-        profiles_path_arg,
-        enable_playbook_arg,
-        enable_fpv_arg,
-        motor_driver,
-        heartbeat,
-        unit_executor,
-        fpv_arbiter,
-    ])

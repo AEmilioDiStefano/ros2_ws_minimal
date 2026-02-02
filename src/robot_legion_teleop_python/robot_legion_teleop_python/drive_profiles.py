@@ -1,131 +1,136 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LicenseRef-Proprietary
-
 """
 drive_profiles.py
 
-This module loads config/robot_profiles.yaml and resolves:
-  - drive_type (diff_drive vs mecanum)
-  - hardware adapter type (what motor driver implementation to use)
-  - params (tuning)
-  - gpio mapping (hardware pins)
-  - cmd_vel topic template
+This module is intentionally "boring": it only loads a YAML registry and resolves
+robot profiles. Keeping it separate makes the rest of the code (teleop, motor driver,
+heartbeat) easier to read and test.
 
-This file is NOT a ROS node; it's pure Python helper code.
-
-WHY THIS MATTERS FOR SCALABILITY
---------------------------------
-For a heterogeneous fleet, you don't want to fork code for every robot type.
-You want:
-  - A single motor_driver_node that reads a profile dict
-  - A single unit_executor that behaves correctly based on drive_type
-  - A single teleop node that changes keybindings based on drive_type
-
-This module is the foundation that makes that configuration-driven.
+Compatibility note:
+Some earlier iterations of this workspace imported a function named
+`load_robot_profiles_yaml()`. Newer code uses `load_profile_registry()`.
+We provide BOTH so older/newer nodes don't crash due to an import rename.
 """
 
-import pathlib
+from __future__ import annotations
+
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
 
-try:
-    # Preferred: find installed share directory
-    from ament_index_python.packages import get_package_share_directory
-    AMENT_AVAILABLE = True
-except Exception:
-    AMENT_AVAILABLE = False
 
-
-def _default_profiles_path() -> pathlib.Path:
+def _default_profiles_path() -> Path:
     """
-    Locate config/robot_profiles.yaml in either:
-      - installed share directory (preferred)
-      - source tree fallback (when running from src)
+    Default location (inside the installed package share dir) is ideal, but for a
+    simple student-friendly workflow we also allow a relative fallback.
+
+    In your repo, this file is typically located at:
+      robot_legion_teleop_python/config/robot_profiles.yaml
     """
-    if AMENT_AVAILABLE:
-        try:
-            share_dir = pathlib.Path(get_package_share_directory("robot_legion_teleop_python"))
-            p = share_dir / "config" / "robot_profiles.yaml"
-            if p.exists():
-                return p
-        except Exception:
-            pass
-
-    # Source tree fallback:
-    # <pkg>/robot_legion_teleop_python/drive_profiles.py -> <pkg>/../config/robot_profiles.yaml
-    here = pathlib.Path(__file__).resolve()
-    pkg_root = here.parents[1]  # .../robot_legion_teleop_python/
-    return pkg_root / "config" / "robot_profiles.yaml"
+    # Repo-relative fallback (works when running from source tree)
+    return Path(__file__).resolve().parents[1] / "config" / "robot_profiles.yaml"
 
 
-def load_profile_registry(path: Optional[str] = None) -> Dict[str, Any]:
+def load_profile_registry(profiles_path: Optional[str] = None) -> Dict[str, Any]:
     """
-    Load the YAML registry.
+    Load the full robot profile registry from YAML.
 
-    path:
-      If provided, load from that explicit location.
-      If empty/None, load from default installed or source-tree path.
+    Args:
+        profiles_path:
+            Optional explicit path to robot_profiles.yaml.
+            If None/empty, we use a reasonable default.
 
     Returns:
-      dict representing the YAML top-level mapping.
+        A dict with keys like:
+            - defaults
+            - robots
+            - drive_profiles
+            - hardware_profiles
     """
-    p = pathlib.Path(path) if path else _default_profiles_path()
-    if not p.exists():
-        raise FileNotFoundError(f"robot_profiles.yaml not found at: {str(p)}")
+    path = Path(profiles_path).expanduser() if profiles_path else _default_profiles_path()
+    if not path.exists():
+        raise FileNotFoundError(
+            f"robot profile registry not found: {path}\n"
+            "Fix by passing `profiles_path:=/full/path/to/robot_profiles.yaml` "
+            "or ensure the file exists in robot_legion_teleop_python/config/."
+        )
 
-    data = yaml.safe_load(p.read_text()) or {}
+    data = yaml.safe_load(path.read_text()) or {}
     if not isinstance(data, dict):
-        raise ValueError("robot_profiles.yaml must be a YAML mapping at top-level")
+        raise ValueError(f"robot profile registry YAML must be a mapping (dict). Got: {type(data)}")
+
+    # Light validation with helpful messages for beginners
+    for required in ("defaults", "robots", "drive_profiles", "hardware_profiles"):
+        if required not in data:
+            raise ValueError(
+                f"robot profile registry missing required key '{required}'. "
+                f"Keys present: {list(data.keys())}"
+            )
+
     return data
 
 
-def resolve_robot_profile(registry: Dict[str, Any], robot_name: str) -> Dict[str, Any]:
+# --- Backwards-compatible alias (older code imports this name) -----------------
+def load_robot_profiles_yaml(profiles_path: Optional[str] = None) -> Dict[str, Any]:
     """
-    Resolve the *effective* robot profile dict.
-
-    Selection priority (most scalable for a fleet):
-      0) registry['drive_profile']  (local per-robot selection)
-      1) registry['robots'][robot_name] (optional centralized mapping table)
-      2) registry['defaults']['profile']
-      3) hard fallback: "diff_hbridge"
-
-    Returns a normalized dict with keys:
-      profile_name, drive_type, hardware, params, gpio, cmd_vel_topic_template
+    Backwards-compatible alias of load_profile_registry().
     """
-    defaults = registry.get("defaults", {}) if isinstance(registry.get("defaults", {}), dict) else {}
-    profiles = registry.get("profiles", {}) if isinstance(registry.get("profiles", {}), dict) else {}
-    robots = registry.get("robots", {}) if isinstance(registry.get("robots", {}), dict) else {}
+    return load_profile_registry(profiles_path)
 
-    # Priority 0: per-robot local selection (best for heterogeneous fleets).
-    local_drive_profile = registry.get("drive_profile", None)
-    if isinstance(local_drive_profile, str) and local_drive_profile.strip():
-        profile_name = local_drive_profile.strip()
-    else:
-        # Priority 1: optional centralized mapping
-        profile_name = robots.get(robot_name, defaults.get("profile", None))
 
-    if not profile_name:
-        profile_name = "diff_hbridge"
+def resolve_robot_profile(reg: Dict[str, Any], robot_name: str) -> Dict[str, Any]:
+    """
+    Resolve a robot into a concrete set of configuration fields.
 
-    profile = profiles.get(profile_name, None)
-    if not isinstance(profile, dict):
-        raise ValueError(f"Profile '{profile_name}' not found in registry")
+    This takes:
+      robots[robot_name] -> {drive_profile: ..., hardware_profile: ...}
+    then expands those names into actual config blocks.
 
-    # Normalize expected keys so the rest of the code doesn't need if/else everywhere.
-    drive_type = str(profile.get("drive_type", "diff_drive")).strip() or "diff_drive"
-    hardware = str(profile.get("hardware", "hbridge_2ch")).strip() or "hbridge_2ch"
+    Returns a dict with:
+        robot_name, drive_type, profile_name, hardware, drive, gpio, etc.
+    """
+    robot_name = str(robot_name).strip()
+    if not robot_name:
+        raise ValueError("resolve_robot_profile() requires a non-empty robot_name")
 
-    params = profile.get("params", {}) if isinstance(profile.get("params", {}), dict) else {}
-    gpio = profile.get("gpio", {}) if isinstance(profile.get("gpio", {}), dict) else {}
+    robots = reg.get("robots", {})
+    if robot_name not in robots:
+        # Student-friendly error: show known robots
+        known = ", ".join(sorted(robots.keys())) if robots else "<none>"
+        raise KeyError(f"Unknown robot '{robot_name}'. Known robots: {known}")
 
-    cmd_tmpl = str(profile.get("cmd_vel_topic_template", "/{robot}/cmd_vel")).strip() or "/{robot}/cmd_vel"
+    robot_entry = robots[robot_name] or {}
+    drive_profile_name = robot_entry.get("drive_profile") or reg["defaults"].get("drive_profile")
+    hw_profile_name = robot_entry.get("hardware_profile") or reg["defaults"].get("hardware_profile")
+
+    if not drive_profile_name:
+        raise ValueError(f"No drive_profile resolved for robot '{robot_name}' (check defaults + robots section)")
+    if not hw_profile_name:
+        raise ValueError(f"No hardware_profile resolved for robot '{robot_name}' (check defaults + robots section)")
+
+    drive_profiles = reg.get("drive_profiles", {})
+    hardware_profiles = reg.get("hardware_profiles", {})
+
+    if drive_profile_name not in drive_profiles:
+        raise KeyError(f"drive_profile '{drive_profile_name}' not found in drive_profiles")
+    if hw_profile_name not in hardware_profiles:
+        raise KeyError(f"hardware_profile '{hw_profile_name}' not found in hardware_profiles")
+
+    drive = drive_profiles[drive_profile_name] or {}
+    hw = hardware_profiles[hw_profile_name] or {}
+
+    drive_type = drive.get("type")
+    if not drive_type:
+        raise ValueError(f"drive_profiles.{drive_profile_name} missing required 'type' field")
 
     return {
-        "profile_name": profile_name,
-        "drive_type": "mecanum" if drive_type == "mecanum" else "diff_drive",
-        "hardware": hardware,
-        "params": params,
-        "gpio": gpio,
-        "cmd_vel_topic_template": cmd_tmpl,
+        "robot_name": robot_name,
+        "profile_name": drive_profile_name,
+        "hardware": hw_profile_name,
+        "drive_type": drive_type,
+        "drive": drive,
+        "hw": hw,
+        "gpio": hw.get("gpio", {}),
     }
