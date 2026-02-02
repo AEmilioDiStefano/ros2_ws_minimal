@@ -35,12 +35,29 @@ class MotorDriverNode(Node):
         self.declare_parameter("profiles_path", "")
         profiles_path = str(self.get_parameter("profiles_path").value).strip() or None
 
+        from pathlib import Path
+
+        gpio_map = {}
         try:
             reg = load_profile_registry(profiles_path)
             prof = resolve_robot_profile(reg, self.robot_name)
             gpio_map = prof.get("gpio", {}) or {}
-        except Exception:
-            gpio_map = {}
+        except Exception as ex:
+            # Log the exception and try a workspace-relative fallback.
+            LOG.warning("Failed to load profile registry (%s). Will try workspace fallback.", ex)
+            try:
+                # Attempt to find a source-tree config/robot_profiles.yaml relative to this file.
+                p = Path(__file__).resolve()
+                candidate = p.parents[2] / "config" / "robot_profiles.yaml"
+                LOG.info("Attempting workspace fallback profiles path: %s", candidate)
+                if candidate.exists():
+                    reg = load_profile_registry(str(candidate))
+                    prof = resolve_robot_profile(reg, self.robot_name)
+                    gpio_map = prof.get("gpio", {}) or {}
+                else:
+                    LOG.warning("Fallback profiles file not found: %s", candidate)
+            except Exception as ex2:
+                LOG.warning("Workspace fallback failed: %s", ex2)
 
         # Normalize common profile naming and initialize hardware interface.
         gpio_map = self._normalize_gpio_map(gpio_map)
