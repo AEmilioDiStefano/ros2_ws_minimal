@@ -6,14 +6,11 @@ setup(
     name=package_name,
     version="0.1.0",
     packages=find_packages(exclude=["test"]),
-    package_data={
-        package_name: [
-            "config/*.yaml",  # Include robot_profiles.yaml and any other config files
-        ],
-    },
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
+        # Install config files to the package share directory so ament can find them
+        ("share/" + package_name + "/config", ["config/robot_profiles.yaml"]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

@@ -21,6 +21,12 @@ import sys
 
 import yaml
 
+try:
+    from ament_index_python.packages import get_package_share_directory
+    AMENT_AVAILABLE = True
+except ImportError:
+    AMENT_AVAILABLE = False
+
 
 def _default_profiles_path() -> Path:
     """
@@ -28,25 +34,26 @@ def _default_profiles_path() -> Path:
 
     Search order:
       1. Explicit parameter (caller provides full path)
-      2. Source tree: robot_legion_teleop_python/config/robot_profiles.yaml
-         (works during development when running from src/)
-      3. Installed package location: site-packages/robot_legion_teleop_python/config/
-         (works after colcon install)
+      2. Installed via ament (colcon install): share/<package>/config/robot_profiles.yaml
+      3. Source tree (development): robot_legion_teleop_python/config/robot_profiles.yaml
 
     In your repo, this file is typically located at:
       robot_legion_teleop_python/config/robot_profiles.yaml
     """
-    # Try source tree first (development mode)
+    # Try installed ament package location first (colcon install mode)
+    if AMENT_AVAILABLE:
+        try:
+            pkg_share = get_package_share_directory("robot_legion_teleop_python")
+            ament_path = Path(pkg_share) / "config" / "robot_profiles.yaml"
+            if ament_path.exists():
+                return ament_path
+        except Exception:
+            pass
+
+    # Try source tree (development mode)
     source_tree_path = Path(__file__).resolve().parents[1] / "config" / "robot_profiles.yaml"
     if source_tree_path.exists():
         return source_tree_path
-
-    # Try installed package location (colcon install mode)
-    # When installed, __file__ will be in site-packages/robot_legion_teleop_python/
-    package_dir = Path(__file__).resolve().parent
-    installed_path = package_dir / "config" / "robot_profiles.yaml"
-    if installed_path.exists():
-        return installed_path
 
     # Fallback to source tree path (will fail with helpful error if not found)
     return source_tree_path
