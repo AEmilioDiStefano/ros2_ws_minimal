@@ -17,20 +17,39 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Optional
+import sys
 
 import yaml
 
 
 def _default_profiles_path() -> Path:
     """
-    Default location (inside the installed package share dir) is ideal, but for a
-    simple student-friendly workflow we also allow a relative fallback.
+    Default location to find robot_profiles.yaml.
+
+    Search order:
+      1. Explicit parameter (caller provides full path)
+      2. Source tree: robot_legion_teleop_python/config/robot_profiles.yaml
+         (works during development when running from src/)
+      3. Installed package location: site-packages/robot_legion_teleop_python/config/
+         (works after colcon install)
 
     In your repo, this file is typically located at:
       robot_legion_teleop_python/config/robot_profiles.yaml
     """
-    # Repo-relative fallback (works when running from source tree)
-    return Path(__file__).resolve().parents[1] / "config" / "robot_profiles.yaml"
+    # Try source tree first (development mode)
+    source_tree_path = Path(__file__).resolve().parents[1] / "config" / "robot_profiles.yaml"
+    if source_tree_path.exists():
+        return source_tree_path
+
+    # Try installed package location (colcon install mode)
+    # When installed, __file__ will be in site-packages/robot_legion_teleop_python/
+    package_dir = Path(__file__).resolve().parent
+    installed_path = package_dir / "config" / "robot_profiles.yaml"
+    if installed_path.exists():
+        return installed_path
+
+    # Fallback to source tree path (will fail with helpful error if not found)
+    return source_tree_path
 
 
 def load_profile_registry(profiles_path: Optional[str] = None) -> Dict[str, Any]:
