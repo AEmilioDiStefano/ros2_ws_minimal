@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -44,6 +46,7 @@ from fleet_orchestrator_interfaces.action import ExecutePlaybook
 from .drive_profiles import load_profile_registry, resolve_robot_profile
 from .playbook_helpers import TimedTwistPlan, run_timed_twist
 from .playbook_contract import validate_and_normalize
+from .audit_logger import AuditLogger
 
 
 class UnitExecutor(Node):
@@ -63,9 +66,24 @@ class UnitExecutor(Node):
         self.robot = str(self.get_parameter("robot_name").value).strip() or getpass.getuser()
 
         profiles_path = str(self.get_parameter("profiles_path").value).strip() or None
-        reg = load_profile_registry(profiles_path)
-        prof = resolve_robot_profile(reg, self.robot)
-        self.drive_type = prof["drive_type"]
+        profiles_path = str(self.get_parameter("profiles_path").value).strip() or None
+
+        prof = None
+        try:
+            reg = load_profile_registry(profiles_path)
+            prof = resolve_robot_profile(reg, self.robot)
+            self.drive_type = prof["drive_type"]
+        except Exception:
+            # Fallback: accept explicit parameters or defaults when registry doesn't contain this robot.
+            self.declare_parameter("drive_type", "diff_drive")
+            self.declare_parameter("hardware", "hbridge_2ch")
+            self.drive_type = str(self.get_parameter("drive_type").value).strip() or "diff_drive"
+            self.hardware = str(self.get_parameter("hardware").value).strip() or "hbridge_2ch"
+            self.profile_name = None
+            self.get_logger().warning(f"[{self.robot}] profile not found in registry; falling back to drive_type={self.drive_type} hardware={self.hardware}")
+        else:
+            self.hardware = prof.get("hardware")
+            self.profile_name = prof.get("profile_name")
 
         # Load baseline speeds
         self.v = float(self.get_parameter("default_transit_speed_mps").value)
@@ -89,9 +107,14 @@ class UnitExecutor(Node):
         # Active goals mapping: id(goal_handle) -> threading.Event
         self._active_goals = {}
 
+        # Audit logging for DIU compliance
+        audit_log_path = os.environ.get("ROBOT_AUDIT_LOG_PATH") or f"/tmp/robot_{self.robot}_audit.jsonl"
+        self.audit = AuditLogger(self, "unit_executor", audit_log_path)
+
         self.get_logger().info(f"[{self.robot}] UnitExecutor ready")
         self.get_logger().info(f"[{self.robot}] action={self.action_name}")
         self.get_logger().info(f"[{self.robot}] drive_type={self.drive_type} cmd_vel={self.cmd_vel_topic}")
+        self.get_logger().info(f"[{self.robot}] Audit log: {audit_log_path}")
 
     # ---------------- action callbacks ----------------
     def goal_cb(self, goal_request):
@@ -99,8 +122,19 @@ class UnitExecutor(Node):
         Validate early (fast reject) so orchestrator gets immediate feedback.
         """
         ok, err, _parsed = validate_and_normalize(goal_request.command_id, goal_request.parameters_json)
+        intent_id = goal_request.intent_id if hasattr(goal_request, "intent_id") else "unknown"
+
         if not ok:
             self.get_logger().warn(f"[{self.robot}] reject goal: {err}")
+            self.audit.log_command(
+                robot=self.robot,
+                source="orchestrator",
+                command_id=goal_request.command_id,
+                parameters=json.loads(goal_request.parameters_json or "{}"),
+                status="rejected",
+                source_id=intent_id,
+                details=err,
+            )
             return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
@@ -157,10 +191,22 @@ class UnitExecutor(Node):
         """
         goal = goal_handle.request
         feedback = ExecutePlaybook.Feedback()
+        intent_id = goal.intent_id if hasattr(goal, "intent_id") else "unknown"
+        goal_start_time = time.time()
 
         ok, err, parsed = validate_and_normalize(goal.command_id, goal.parameters_json)
         if not ok or parsed is None:
             self.get_logger().warn(f"[{self.robot}] execute rejected late: {err}")
+            self.audit.log_command(
+                robot=self.robot,
+                source="orchestrator",
+                command_id=goal.command_id,
+                parameters=json.loads(goal.parameters_json or "{}"),
+                status="failed",
+                source_id=intent_id,
+                details=err,
+                duration_s=time.time() - goal_start_time,
+            )
             goal_handle.abort()
             result = ExecutePlaybook.Result()
             result.success = False
@@ -173,6 +219,16 @@ class UnitExecutor(Node):
         # Create a stop event so cancel requests can interrupt run_timed_twist
         stop_event = threading.Event()
         self._active_goals[id(goal_handle)] = stop_event
+
+        # Log goal execution start
+        self.audit.log_command(
+            robot=self.robot,
+            source="orchestrator",
+            command_id=goal.command_id,
+            parameters=parsed.raw_params,
+            status="started",
+            source_id=intent_id,
+        )
 
         # Apply speed scaling
         v = self.v * parsed.speed_scale
@@ -243,7 +299,30 @@ class UnitExecutor(Node):
         result = ExecutePlaybook.Result()
         result.success = True
         result.result_text = "ok"
+        
+        # Log successful goal execution
+        goal_duration_s = time.time() - goal_start_time
+        self.audit.log_command(
+            robot=self.robot,
+            source="orchestrator",
+            command_id=goal_request.command_id,
+            parameters=json.loads(goal_request.parameters_json or "{}"),
+            status="succeeded",
+            source_id=intent_id,
+            duration_s=goal_duration_s,
+        )
+        
+        # Clean up the active goal tracking
+        if intent_id in self._active_goals:
+            del self._active_goals[intent_id]
+        
         return result
+
+    def destroy_node(self) -> None:
+        """Clean up resources and close audit log."""
+        if hasattr(self, 'audit') and self.audit:
+            self.audit.close()
+        super().destroy_node()
 
 
 def main(args=None):

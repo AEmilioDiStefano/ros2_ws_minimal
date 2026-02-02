@@ -2,6 +2,7 @@
 import time
 import getpass
 import logging
+import os
 
 import rclpy
 from rclpy.node import Node
@@ -9,6 +10,7 @@ from geometry_msgs.msg import Twist
 
 from .drive_profiles import load_profile_registry, resolve_robot_profile
 from .hardware_interface import HardwareInterface
+from .audit_logger import AuditLogger
 
 LOG = logging.getLogger("motor_driver_node")
 
@@ -63,7 +65,12 @@ class MotorDriverNode(Node):
         self.timeout_sec = 0.5
         self.create_timer(0.1, self._watchdog)
 
+        # Audit logging for DIU compliance
+        audit_log_path = os.environ.get("ROBOT_AUDIT_LOG_PATH") or f"/tmp/robot_{self.robot_name}_audit.jsonl"
+        self.audit = AuditLogger(self, "motor_driver", audit_log_path)
+
         self.get_logger().info(f"[{self.robot_name}] Motor driver listening on {self.cmd_vel_topic}")
+        self.get_logger().info(f"[{self.robot_name}] Audit log: {audit_log_path}")
 
     # --------------------------------------------------
 
@@ -120,6 +127,7 @@ class MotorDriverNode(Node):
 
     def cmd_vel_callback(self, msg: Twist):
         self.last_cmd_time = time.time()
+        start_time = time.time()
 
         wheel_sep = float(self.get_parameter("wheel_separation").value)
         max_lin = float(self.get_parameter("max_linear_speed").value)
@@ -127,6 +135,16 @@ class MotorDriverNode(Node):
 
         v = max(-max_lin, min(max_lin, msg.linear.x))
         w = max(-max_ang, min(max_ang, msg.angular.z))
+
+        # Log motor command for audit trail
+        self.audit.log_command(
+            robot=self.robot_name,
+            source="cmd_vel",
+            command_id="twist",
+            parameters={"linear_x": float(msg.linear.x), "angular_z": float(msg.angular.z)},
+            status="received",
+            duration_s=time.time() - start_time,
+        )
 
         # ===============================
         # TANK-SPIN OVERRIDE
@@ -184,6 +202,11 @@ class MotorDriverNode(Node):
         try:
             if hasattr(self, "hw"):
                 self.hw.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "audit"):
+                self.audit.close()
         except Exception:
             pass
         super().destroy_node()

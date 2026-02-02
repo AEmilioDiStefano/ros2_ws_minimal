@@ -3,7 +3,7 @@
 """
 drive_profiles.py
 
-This module is intentionally "boring": it only loads a YAML registry and resolves
+This module loads a YAML registry and resolves
 robot profiles. Keeping it separate makes the rest of the code (teleop, motor driver,
 heartbeat) easier to read and test.
 

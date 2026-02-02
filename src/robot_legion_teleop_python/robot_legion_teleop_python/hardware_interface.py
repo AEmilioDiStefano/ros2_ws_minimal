@@ -54,11 +54,23 @@ class HardwareInterface:
         self.gpio_map = gpio_map or {}
         self.left_pwm = None
         self.right_pwm = None
+        # Allow per-motor polarity inversion via profile flags. Accept several key names.
+        self.invert_left = bool(
+            self.gpio_map.get("invert_left")
+            or self.gpio_map.get("left_inverted")
+            or self.gpio_map.get("left_polarity_invert")
+        )
+        self.invert_right = bool(
+            self.gpio_map.get("invert_right")
+            or self.gpio_map.get("right_inverted")
+            or self.gpio_map.get("right_polarity_invert")
+        )
 
         if GPIO_AVAILABLE and self.gpio_map:
             try:
                 self._setup_gpio()
                 LOG.info("GPIO hardware interface initialized")
+                LOG.info("GPIO map keys: %s; invert_left=%s invert_right=%s", list(self.gpio_map.keys()), self.invert_left, self.invert_right)
             except Exception as e:
                 LOG.warning("GPIO init failed: %s", e)
                 self._mock_mode()
@@ -109,6 +121,12 @@ class HardwareInterface:
         if getattr(self, "_mock", True):
             LOG.debug("MOCK set_motor: L(duty=%s,dir=%s) R(duty=%s,dir=%s)", left_duty, left_dir, right_duty, right_dir)
             return
+
+        # Apply configured polarity inversion if requested by the profile
+        if self.invert_left:
+            left_dir = -left_dir
+        if self.invert_right:
+            right_dir = -right_dir
 
         # left motor pins
         in1 = self.gpio_map.get("in1_left")

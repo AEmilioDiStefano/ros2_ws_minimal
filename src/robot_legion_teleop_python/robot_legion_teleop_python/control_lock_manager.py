@@ -40,11 +40,14 @@ Locks expire if no heartbeat is received for lease_sec seconds.
 
 import json
 import time
+import os
 from typing import Dict, Tuple, Optional
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
+
+from .audit_logger import AuditLogger
 
 
 def now_s() -> float:
@@ -54,6 +57,9 @@ def now_s() -> float:
 class ControlLockManager(Node):
     def __init__(self):
         super().__init__("control_lock_manager")
+
+        # Initialize audit logger
+        self.audit = AuditLogger(self, "control_lock_manager", log_file_path="/tmp/control_lock_audit.jsonl")
 
         self.declare_parameter("lease_sec", 5.0)
         self.lease_sec = float(self.get_parameter("lease_sec").value)
@@ -116,23 +122,60 @@ class ControlLockManager(Node):
         if action == "acquire":
             if owner is None:
                 self._locks[robot] = (client_id, now_s())
+                self.audit.log_command(
+                    robot=robot,
+                    source="control_lock_manager",
+                    command_id=f"acquire_{client_id}",
+                    parameters={"client_id": client_id},
+                    status="granted",
+                )
                 self._respond(client_id, {"ok": True, "action": "acquire", "robot": robot, "owner": client_id})
                 return
 
             if owner == client_id:
                 # re-acquire refresh
                 self._locks[robot] = (client_id, now_s())
+                self.audit.log_command(
+                    robot=robot,
+                    source="control_lock_manager",
+                    command_id=f"acquire_{client_id}",
+                    parameters={"client_id": client_id},
+                    status="refreshed",
+                )
                 self._respond(client_id, {"ok": True, "action": "acquire", "robot": robot, "owner": client_id})
                 return
 
+            self.audit.log_command(
+                robot=robot,
+                source="control_lock_manager",
+                command_id=f"acquire_{client_id}",
+                parameters={"client_id": client_id, "owner": owner},
+                status="denied",
+                details=f"Robot locked by {owner}",
+            )
             self._respond(client_id, {"ok": False, "action": "acquire", "robot": robot, "owner": owner, "reason": "locked"})
             return
 
         if action == "release":
             if owner == client_id:
                 self._locks.pop(robot, None)
+                self.audit.log_command(
+                    robot=robot,
+                    source="control_lock_manager",
+                    command_id=f"release_{client_id}",
+                    parameters={"client_id": client_id},
+                    status="released",
+                )
                 self._respond(client_id, {"ok": True, "action": "release", "robot": robot, "owner": ""})
                 return
+            self.audit.log_command(
+                robot=robot,
+                source="control_lock_manager",
+                command_id=f"release_{client_id}",
+                parameters={"client_id": client_id, "owner": owner or ""},
+                status="denied",
+                details="Not the lock owner",
+            )
             self._respond(client_id, {"ok": False, "action": "release", "robot": robot, "owner": owner or "", "reason": "not_owner"})
             return
 
@@ -143,6 +186,12 @@ class ControlLockManager(Node):
                 return
             # ignore heartbeats from non-owner
             return
+
+    def destroy_node(self) -> None:
+        """Clean up resources and close audit log."""
+        if hasattr(self, 'audit') and self.audit:
+            self.audit.close()
+        super().destroy_node()
 
 
 def main(args=None):

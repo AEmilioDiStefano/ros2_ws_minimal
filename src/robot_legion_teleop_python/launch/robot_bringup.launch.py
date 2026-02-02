@@ -37,6 +37,9 @@ def _make_nodes(context, *args, **kwargs):
 
     video_device = LaunchConfiguration("video_device").perform(context)
     use_camera = LaunchConfiguration("use_camera").perform(context).lower() in ("1", "true", "yes", "on")
+    drive_type = LaunchConfiguration("drive_type").perform(context)
+    hardware = LaunchConfiguration("hardware").perform(context)
+    profiles_path = LaunchConfiguration("profiles_path").perform(context) or ""
 
     nodes = []
 
@@ -51,6 +54,26 @@ def _make_nodes(context, *args, **kwargs):
             parameters=[
                 {"robot_name": robot_name},
                 {"cmd_vel_topic": f"/{robot_name}/cmd_vel"},
+                {"profiles_path": profiles_path},
+                {"drive_type": drive_type},
+                {"hardware": hardware},
+            ],
+        )
+    )
+
+    # Heartbeat publisher under /<robot_name>/heartbeat so teleop/control can discover
+    nodes.append(
+        Node(
+            package="robot_legion_teleop_python",
+            executable="heartbeat_node",
+            name="heartbeat_node",
+            namespace=robot_name,
+            output="screen",
+            parameters=[
+                {"robot_name": robot_name},
+                {"profiles_path": profiles_path},
+                {"drive_type": drive_type},
+                {"hardware": hardware},
             ],
         )
     )
@@ -83,6 +106,21 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("video_device", default_value="/dev/video0"),
             DeclareLaunchArgument("use_camera", default_value="true"),
+            DeclareLaunchArgument(
+                "drive_type",
+                default_value="diff_drive",
+                description="Robot drive type: 'diff_drive' for differential drive, 'mecanum' for omnidirectional",
+            ),
+            DeclareLaunchArgument(
+                "hardware",
+                default_value="hbridge_2ch",
+                description="Motor driver hardware profile: 'hbridge_2ch', 'tb6612_dual', etc.",
+            ),
+            DeclareLaunchArgument(
+                "profiles_path",
+                default_value="",
+                description="Optional path to custom robot_profiles.yaml file (empty = use installed default)",
+            ),
             OpaqueFunction(function=_make_nodes),
         ]
     )
