@@ -44,8 +44,6 @@ import select
 import termios
 import tty
 import time
-import json
-import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -54,11 +52,8 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 
-from .audit_logger import AuditLogger
-
 
 CMD_VEL_RE = re.compile(r"^/([^/]+)/cmd_vel$")
-HEARTBEAT_RE = re.compile(r"^/([^/]+)/heartbeat$")
 
 
 def restore_terminal_settings(settings):
@@ -99,22 +94,9 @@ class RobotLegionTeleop(Node):
     def __init__(self):
         super().__init__("robot_legion_teleop_python")
 
-        # Initialize audit logger
-        self.audit = AuditLogger(self, "teleop", log_file_path="/tmp/teleop_audit.jsonl")
-
         # Optional parameters
         self.declare_parameter("allow_cmd_vel_switching", True)
         self.allow_cmd_vel_switching = bool(self.get_parameter("allow_cmd_vel_switching").value)
-
-        # Observed robot profiles discovered via heartbeat topics.
-        # Mapping: robot_name -> {"drive_type": str, "hardware": str, "t": timestamp}
-        self._observed_profiles = {}
-
-        # Heartbeat subscriptions we create dynamically: robot_name -> subscription
-        self._hb_subs = {}
-
-        # Timer to refresh heartbeat discovery and to expire stale entries
-        self.create_timer(1.0, self._refresh_heartbeats)
 
         # Used for circle-turn math (must match motor_driver_node)
         self.declare_parameter("wheel_separation", 0.18)
@@ -246,54 +228,6 @@ class RobotLegionTeleop(Node):
             # Stop early as soon as we see any available robot
             if self.list_available_robots():
                 return
-
-    # ---------------- Heartbeat discovery ----------------
-
-    def _heartbeat_callback(self, msg: String, topic_name: str):
-        """Callback for per-robot heartbeat subscription. We record the reported
-        drive_type and hardware so teleop and other components can adapt
-        behavior dynamically without hard-coded robot names in config.
-        """
-        try:
-            data = json.loads(msg.data or "{}")
-        except Exception:
-            return
-        robot = data.get("robot")
-        if not robot:
-            # Try to extract robot from topic as a fallback
-            m = HEARTBEAT_RE.match(topic_name)
-            robot = m.group(1) if m else None
-        if not robot:
-            return
-        self._observed_profiles[robot] = {
-            "drive_type": data.get("drive_type"),
-            "hardware": data.get("hardware"),
-            "t": data.get("t", time.time()),
-        }
-
-    def _refresh_heartbeats(self):
-        """Find heartbeat topics and subscribe to new ones; expire old observed entries."""
-        # Discover heartbeat topics in the graph
-        topics_and_types = self.get_topic_names_and_types()
-        for (t, _types) in topics_and_types:
-            m = HEARTBEAT_RE.match(t)
-            if not m:
-                continue
-            robot = m.group(1)
-            if robot in self._hb_subs:
-                continue
-            # Create a subscription capturing the topic name in a lambda
-            try:
-                sub = self.create_subscription(String, t, lambda msg, tn=t: self._heartbeat_callback(msg, tn), 10)
-                self._hb_subs[robot] = sub
-            except Exception:
-                pass
-
-        # Expire observed entries older than a few seconds
-        now = time.time()
-        expired = [r for r, v in self._observed_profiles.items() if now - float(v.get("t", now)) > 5.0]
-        for r in expired:
-            self._observed_profiles.pop(r, None)
 
     # ---------------- State for easy web integration ----------------
 
@@ -499,7 +433,7 @@ class RobotLegionTeleop(Node):
         self.last_twist = twist
         self.is_moving = True
 
-        self._publish_and_log_twist(twist, "one-track-circle")
+        self.publisher_.publish(twist)
 
     # ---------------- Republish + Offline watchdog ----------------
 
@@ -508,7 +442,7 @@ class RobotLegionTeleop(Node):
             return
 
         if abs(self.last_twist.linear.x) > 1e-9 or abs(self.last_twist.angular.z) > 1e-9:
-            self._publish_and_log_twist(self.last_twist, "republish")
+            self.publisher_.publish(self.last_twist)
             return
 
         if self.last_lin_mult == 0.0 and self.last_ang_mult == 0.0:
@@ -517,7 +451,7 @@ class RobotLegionTeleop(Node):
         twist = Twist()
         twist.linear.x = self.linear_speed * self.last_lin_mult
         twist.angular.z = self.angular_speed * self.last_ang_mult
-        self._publish_and_log_twist(twist, "republish")
+        self.publisher_.publish(twist)
 
     def _offline_watchdog(self):
         """
@@ -536,7 +470,7 @@ class RobotLegionTeleop(Node):
         self._tprint(f"[OFFLINE] Robot '{self.current_robot_name}' appears offline (no subscribers on {self.cmd_vel_topic}).")
         self._tprint("[OFFLINE] Stopping and returning to robot selection.")
         try:
-            self._publish_and_log_twist(Twist(), "offline-stop")
+            self.publisher_.publish(Twist())
         except Exception:
             pass
 
@@ -553,28 +487,6 @@ class RobotLegionTeleop(Node):
         self.publisher_ = None
         self.cmd_vel_topic = None
         self.current_robot_name = None
-
-    def _publish_and_log_twist(self, twist: Twist, description: str = ""):
-        """Publish a Twist command and log to audit trail."""
-        if self.publisher_ is None or self.current_robot_name is None:
-            return
-        
-        try:
-            self.publisher_.publish(twist)
-            # Log to audit trail
-            self.audit.log_command(
-                robot=self.current_robot_name,
-                source="teleop",
-                command_id="twist",
-                parameters={
-                    "linear_x": float(twist.linear.x),
-                    "angular_z": float(twist.angular.z),
-                    "description": description,
-                },
-                status="sent",
-            )
-        except Exception as e:
-            self.get_logger().error(f"Error publishing Twist: {e}")
 
     # ---------------- Speed modifiers ----------------
 
@@ -694,41 +606,15 @@ class RobotLegionTeleop(Node):
                     mode, lin_mult, ang_mult = self.move_bindings[key]
 
                     if mode == "circle":
-                        # Circle/one-track semantics differ by drive type. For diff_drive
-                        # we synthesize a one-track circle via left/right track speeds.
-                        # For omni/mecanum, convert to a safer lateral+rotational motion.
                         S = self.linear_speed
-                        profile = self._observed_profiles.get(self.current_robot_name) or {}
-                        drive_type = (profile.get("drive_type") or "diff_drive").lower()
-
-                        if drive_type in ("diff_drive", "diff", "diff-drive"):
-                            if key == "7":
-                                self._publish_one_track_circle(v_left=0.0, v_right=+S)
-                            elif key == "9":
-                                self._publish_one_track_circle(v_left=+S, v_right=0.0)
-                            elif key == "1":
-                                self._publish_one_track_circle(v_left=0.0, v_right=-S)
-                            elif key == "3":
-                                self._publish_one_track_circle(v_left=-S, v_right=0.0)
-                        else:
-                            # Omni/mecanum: emulate circle via a combination of forward/back
-                            # and a small angular velocity. Keep behaviors intuitive for user.
-                            twist = Twist()
-                            if key == "7":
-                                twist.linear.x = +S
-                                twist.angular.z = +0.5 * self.angular_speed
-                            elif key == "9":
-                                twist.linear.x = +S
-                                twist.angular.z = -0.5 * self.angular_speed
-                            elif key == "1":
-                                twist.linear.x = -S
-                                twist.angular.z = +0.5 * self.angular_speed
-                            elif key == "3":
-                                twist.linear.x = -S
-                                twist.angular.z = -0.5 * self.angular_speed
-                            self.last_twist = twist
-                            self.is_moving = True
-                            self._publish_and_log_twist(twist, f"circle-{key}")
+                        if key == "7":
+                            self._publish_one_track_circle(v_left=0.0, v_right=+S)
+                        elif key == "9":
+                            self._publish_one_track_circle(v_left=+S, v_right=0.0)
+                        elif key == "1":
+                            self._publish_one_track_circle(v_left=0.0, v_right=-S)
+                        elif key == "3":
+                            self._publish_one_track_circle(v_left=-S, v_right=0.0)
                         continue
 
                     # Normal twist
@@ -741,12 +627,12 @@ class RobotLegionTeleop(Node):
 
                     self.last_twist = twist
                     self.is_moving = True
-                    self._publish_and_log_twist(twist, "normal-twist")
+                    self.publisher_.publish(twist)
                     continue
 
                 # Stop
                 if key in (" ", "5", "s"):
-                    self._publish_and_log_twist(Twist(), "stop")
+                    self.publisher_.publish(Twist())
                     self.is_moving = False
                     self.last_lin_mult = 0.0
                     self.last_ang_mult = 0.0
@@ -767,13 +653,10 @@ class RobotLegionTeleop(Node):
         finally:
             try:
                 if self.publisher_ is not None:
-                    self._publish_and_log_twist(Twist(), "cleanup")
+                    self.publisher_.publish(Twist())
             except Exception:
                 pass
             restore_terminal_settings(self._terminal_settings)
-            # Clean up audit logger
-            if hasattr(self, 'audit') and self.audit:
-                self.audit.close()
 
 
 def main(args=None):
