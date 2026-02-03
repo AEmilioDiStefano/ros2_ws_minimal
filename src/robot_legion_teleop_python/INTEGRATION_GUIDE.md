@@ -229,6 +229,26 @@ Parameters:
 - `drive_type`: `diff_drive` (2-motor) or `mecanum` (4-motor)
 - `hardware`: `hbridge_2ch` (H-bridge relay) or `tb6612_dual` (TB6612FNG dual driver), etc.
 - `profiles_path`: Optional custom YAML file path
+- `use_camera`: `true` (default) or `false` to disable USB camera
+
+#### Graceful Degradation for Missing Packages
+
+If a robot doesn't have a camera or the `v4l2_camera` package is not installed, the launch will skip the camera node but continue with motor control:
+
+```
+[INFO] [launch.user]: [OK] motor_driver_node ready
+[INFO] [launch.user]: [OK] heartbeat_node ready
+[INFO] [launch.user]: [SKIP] camera: pkg 'v4l2_camera'
+[INFO] [launch.user]:        not found
+```
+
+**To explicitly disable camera** (faster startup if not needed):
+```bash
+ros2 launch robot_legion_teleop_python robot_bringup.launch.py \
+  use_camera:=false
+```
+
+This ensures robots without cameras or with camera hardware failures can still be controlled via the motor_driver node and heartbeat discovery.
 
 ### 4. Start Control Station
 
