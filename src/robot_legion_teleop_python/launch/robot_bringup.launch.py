@@ -6,7 +6,7 @@ from launch_ros.actions import Node
 import os
 import re
 import getpass
-import subprocess
+from ament_index_python.packages import get_package_share_directory
 
 
 def _sanitize_ros_name(name: str) -> str:
@@ -64,15 +64,10 @@ def _make_nodes(context, *args, **kwargs):
             nodes.append(LogInfo(msg=line))
 
     def _package_exists(pkg_name: str) -> bool:
-        """Check if ROS 2 package is installed."""
+        """Check if ROS 2 package is installed using ament index."""
         try:
-            result = subprocess.run(
-                ["ros2", "pkg", "prefix", pkg_name],
-                capture_output=True,
-                timeout=2,
-                text=True,
-            )
-            return result.returncode == 0
+            get_package_share_directory(pkg_name)
+            return True
         except Exception:
             return False
 

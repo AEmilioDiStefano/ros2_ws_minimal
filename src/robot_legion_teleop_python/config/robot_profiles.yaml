@@ -8,11 +8,11 @@ robots:
   # Differential-drive robots
   robot1:
     drive_profile: drive_diff
-    hardware_profile: tb6612_dual
+    hardware_profile: hbridge_2ch
 
   robot2:
-    drive_profile: tb6612_dual
-    hardware_profile: hbridge_2ch
+    drive_profile: drive_omni
+    hardware_profile: tb6612_dual
 
   robot3:
     drive_profile: drive_diff
