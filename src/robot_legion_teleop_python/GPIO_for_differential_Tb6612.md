@@ -1,4 +1,4 @@
-# GPIO connections from L298N motor controller to Raspberry Pi 4 for DIFFERENTIAL DRIVE Chassis  
+# GPIO connections from Raspberry Pi 4 to DUAL Tb6612fng motor controllers to motors for TANK MOTORS for DIFFERENTIAL DRIVE Chassis  
 
 ### TB6612 #1 — LEFT SIDE MOTORS  
 
