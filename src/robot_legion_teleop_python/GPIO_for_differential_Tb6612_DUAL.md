@@ -4,7 +4,7 @@
 
 **Left Front Motor** (Channel A)  
 
-Motor wires  
+**Motor wires**  
 
 Motor + to A01  
 
@@ -20,7 +20,7 @@ AIN2 to GPIO 6
 
 **Left Rear Motor** (Channel B)  
 
-Motor wires  
+**Motor wires**  
 
 Motor + to B01  
 
@@ -46,7 +46,7 @@ STBY to GPIO 21
 
 **Right Front Motor** (Channel A)  
 
-Motor wires  
+**Motor wires**  
 
 Motor + to A01  
 
@@ -62,7 +62,7 @@ AIN2 to GPIO 24
 
 **Right Rear Motor** (Channel B)  
 
-Motor wires  
+**Motor wires**  
 
 Motor + to B01  
 
@@ -79,7 +79,7 @@ BIN2 to GPIO 8
 **Standby (board enable)**  
 
 STBY to GPIO 7  
-(you may also tie both STBY pins together and drive them from ONE GPIO if desired)  
+**(you may also tie both STBY pins together and drive them from ONE GPIO if desired)**  
 
 <br>  
 <br>  
