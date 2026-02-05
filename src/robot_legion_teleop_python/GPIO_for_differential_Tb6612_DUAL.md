@@ -40,8 +40,6 @@ STBY to GPIO 21
 (or tie to 3.3V if you never want software disable)  
 
 <br>
-<br>
-<br>
 
 ### TB6612 #2 — RIGHT SIDE MOTORS  
 
