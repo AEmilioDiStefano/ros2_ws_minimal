@@ -115,7 +115,7 @@ Pi GND to TB6612 GND to Battery – (negative)
 
 ### STBY (enable)  
 
-For simplest wiring:  
+**For simplest wiring**:  
 
 On TB6612 #1: STBY to VCC (same board)  
 
