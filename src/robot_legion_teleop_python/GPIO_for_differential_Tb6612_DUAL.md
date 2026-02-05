@@ -96,7 +96,7 @@ Pi GND to GND on both boards
 
 ### Motor power  
 
-If you’re using your 2×18650 (2S) pack:  
+**If you’re using your 2×18650 (2S) pack**:  
 
 Battery + to VM on both boards  
 
@@ -106,9 +106,9 @@ Battery – to GND on both boards
 
 ### Common ground (critical)  
 
-All grounds must connect together:  
+**All grounds must connect together**:  
 
-**Pi GND to TB6612 GND to Battery – (negative)**  
+Pi GND to TB6612 GND to Battery – (negative)  
 
 <br>  
 
