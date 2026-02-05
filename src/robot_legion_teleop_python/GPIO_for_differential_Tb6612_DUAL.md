@@ -2,7 +2,7 @@
 
 ### TB6612 #1 — LEFT SIDE MOTORS  
 
-**Left Front Motor** (Channel A)  
+**Left Front Motor (Channel A)**  
 
 **Motor wires**  
 
@@ -18,7 +18,7 @@ AIN1 to GPIO 5
 
 AIN2 to GPIO 6  
 
-**Left Rear Motor** (Channel B)  
+**Left Rear Motor (Channel B)**  
 
 **Motor wires**  
 
@@ -36,15 +36,16 @@ BIN2 to GPIO 20
 
 **Standby (board enable)**  
 
-STBY to GPIO 21   
-(or tie to 3.3V if you never want software disable)  
+STBY to GPIO 21  
+
+**(or tie to 3.3V if you never want software disable)**  
 
 <br>  
 <br>  
 
 ### TB6612 #2 — RIGHT SIDE MOTORS  
 
-**Right Front Motor** (Channel A)  
+**Right Front Motor (Channel A)**  
 
 **Motor wires**  
 
@@ -60,7 +61,7 @@ AIN1 to GPIO 23
 
 AIN2 to GPIO 24  
 
-**Right Rear Motor** (Channel B)  
+**Right Rear Motor (Channel B)**  
 
 **Motor wires**  
 
