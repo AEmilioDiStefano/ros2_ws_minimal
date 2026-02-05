@@ -39,7 +39,8 @@ BIN2 to GPIO 20
 STBY to GPIO 21   
 (or tie to 3.3V if you never want software disable)  
 
-<br>
+<br>  
+<br>  
 
 ### TB6612 #2 — RIGHT SIDE MOTORS  
 
@@ -49,9 +50,9 @@ Motor wires
 
 Motor + to A01  
 
-Motor − to A02  
+Motor − to A02   
 
-GPIO connections  
+**GPIO connections**  
 
 PWMA to GPIO 18 (PWM)  
 
@@ -67,7 +68,7 @@ Motor + to B01
 
 Motor − to B02  
 
-GPIO connections  
+**GPIO connections**  
 
 PWMB to GPIO 19 (PWM)  
 
@@ -80,6 +81,7 @@ BIN2 to GPIO 8
 STBY to GPIO 7  
 (you may also tie both STBY pins together and drive them from ONE GPIO if desired)  
 
+<br>  
 <br>  
 
 ### Logic power  
