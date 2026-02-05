@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 import time
 import getpass
+import logging
+import os
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
-try:
-    import RPi.GPIO as GPIO
-    GPIO_AVAILABLE = True
-except ImportError:
-    GPIO_AVAILABLE = False
+from .drive_profiles import load_profile_registry, resolve_robot_profile
+from .hardware_interface import HardwareInterface
+from .audit_logger import AuditLogger
+
+LOG = logging.getLogger("motor_driver_node")
 
 
 class MotorDriverNode(Node):
@@ -31,21 +33,24 @@ class MotorDriverNode(Node):
         self.declare_parameter("cmd_vel_topic", f"/{self.robot_name}/cmd_vel")
         self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value.strip() or f"/{self.robot_name}/cmd_vel"
 
-        # GPIO pins (BCM)
-        self.EN_A = 12
-        self.IN1 = 17
-        self.IN2 = 27
-        self.IN3 = 22
-        self.IN4 = 23
-        self.EN_B = 13
+        # Hardware abstraction - load profile-based GPIO mapping when available
+        self.declare_parameter("profiles_path", "")
+        profiles_path = str(self.get_parameter("profiles_path").value).strip() or None
 
-        self.left_pwm = None
-        self.right_pwm = None
+        gpio_map = {}
+        try:
+            reg = load_profile_registry(profiles_path)
+            prof = resolve_robot_profile(reg, self.robot_name)
+            gpio_map = prof.get("gpio", {}) or {}
+            self.get_logger().info(f"[{self.robot_name}] Loaded GPIO map from profile: {list(gpio_map.keys())}")
+        except Exception as ex:
+            # Log the exception; drive_profiles.py should have already tried fallbacks.
+            self.get_logger().warning(f"[{self.robot_name}] Failed to load profile registry: {ex}")
+            self.get_logger().warning(f"[{self.robot_name}] Will run in mock hardware mode. To fix, pass profiles_path parameter or rebuild package.")
 
-        if GPIO_AVAILABLE:
-            self._setup_gpio()
-        else:
-            self.get_logger().warn("RPi.GPIO not available. Motors will NOT move.")
+        # Normalize common profile naming and initialize hardware interface.
+        gpio_map = self._normalize_gpio_map(gpio_map)
+        self.hw = HardwareInterface(gpio_map)
 
         # Subscriber
         self.subscription = self.create_subscription(
@@ -60,30 +65,69 @@ class MotorDriverNode(Node):
         self.timeout_sec = 0.5
         self.create_timer(0.1, self._watchdog)
 
+        # Audit logging for DIU compliance
+        audit_log_path = os.environ.get("ROBOT_AUDIT_LOG_PATH") or f"/tmp/robot_{self.robot_name}_audit.jsonl"
+        self.audit = AuditLogger(self, "motor_driver", audit_log_path)
+
         self.get_logger().info(f"[{self.robot_name}] Motor driver listening on {self.cmd_vel_topic}")
+        self.get_logger().info(f"[{self.robot_name}] Audit log: {audit_log_path}")
 
     # --------------------------------------------------
 
-    def _setup_gpio(self):
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
+    def _normalize_gpio_map(self, gpio_map: dict) -> dict:
+        """Normalize different hardware profile key names into a common
+        mapping consumed by HardwareInterface (en_left,in1_left,in2_left,en_right,...).
 
-        for pin in [self.IN1, self.IN2, self.IN3, self.IN4, self.EN_A, self.EN_B]:
-            GPIO.setup(pin, GPIO.OUT)
+        This keeps motor mixing logic independent of exact profile naming.
+        """
+        if not gpio_map:
+            return {}
 
-        self.left_pwm = GPIO.PWM(self.EN_A, 1000)
-        self.right_pwm = GPIO.PWM(self.EN_B, 1000)
+        # If profile already uses expected keys, return as-is
+        expected = ("en_left", "in1_left", "in2_left", "en_right", "in1_right", "in2_right")
+        if all(k in gpio_map for k in ("en_left", "in1_left", "in2_left")) or all(k in gpio_map for k in ("fl_pwm", "fr_pwm")):
+            # Map TB6612 style (fl/fr -> left/right) to en_left/en_right
+            mapped = {}
+            if "en_left" in gpio_map:
+                mapped.update(gpio_map)
+                return mapped
 
-        self.left_pwm.start(0)
-        self.right_pwm.start(0)
+        mapped = {}
+        # TB6612 dual naming -> map front-left/front-right to left/right
+        if "fl_pwm" in gpio_map and "fr_pwm" in gpio_map:
+            mapped["en_left"] = gpio_map.get("fl_pwm")
+            mapped["in1_left"] = gpio_map.get("fl_in1")
+            mapped["in2_left"] = gpio_map.get("fl_in2")
 
-        self._set_motor_outputs(0.0, 0.0)
-        self.get_logger().info("GPIO initialized for motor control")
+            mapped["en_right"] = gpio_map.get("fr_pwm")
+            mapped["in1_right"] = gpio_map.get("fr_in1")
+            mapped["in2_right"] = gpio_map.get("fr_in2")
+            return mapped
+
+        # hbridge_2ch style mapping
+        if "en_left" in gpio_map or "in1_left" in gpio_map:
+            mapped.update(gpio_map)
+            return mapped
+
+        # older-style keys (en_left/en_right names may vary)
+        # try common alternative keys
+        if "ena" in gpio_map and "enb" in gpio_map:
+            mapped["en_left"] = gpio_map.get("ena")
+            mapped["en_right"] = gpio_map.get("enb")
+            mapped["in1_left"] = gpio_map.get("in1_left")
+            mapped["in2_left"] = gpio_map.get("in2_left")
+            mapped["in1_right"] = gpio_map.get("in1_right")
+            mapped["in2_right"] = gpio_map.get("in2_right")
+            return mapped
+
+        # fallback: return original map, HardwareInterface will mock if keys absent
+        return gpio_map
 
     # --------------------------------------------------
 
     def cmd_vel_callback(self, msg: Twist):
         self.last_cmd_time = time.time()
+        start_time = time.time()
 
         wheel_sep = float(self.get_parameter("wheel_separation").value)
         max_lin = float(self.get_parameter("max_linear_speed").value)
@@ -91,6 +135,16 @@ class MotorDriverNode(Node):
 
         v = max(-max_lin, min(max_lin, msg.linear.x))
         w = max(-max_ang, min(max_ang, msg.angular.z))
+
+        # Log motor command for audit trail
+        self.audit.log_command(
+            robot=self.robot_name,
+            source="cmd_vel",
+            command_id="twist",
+            parameters={"linear_x": float(msg.linear.x), "angular_z": float(msg.angular.z)},
+            status="received",
+            duration_s=time.time() - start_time,
+        )
 
         # ===============================
         # TANK-SPIN OVERRIDE
@@ -119,9 +173,7 @@ class MotorDriverNode(Node):
     # --------------------------------------------------
 
     def _set_motor_outputs(self, v_left: float, v_right: float):
-        if not GPIO_AVAILABLE:
-            return
-
+        # Convert speeds to duty+direction and delegate to hardware interface
         max_lin = float(self.get_parameter("max_linear_speed").value)
         max_pwm = float(self.get_parameter("max_pwm").value)
 
@@ -134,25 +186,29 @@ class MotorDriverNode(Node):
         left_duty, left_dir = speed_to_pwm(v_left)
         right_duty, right_dir = speed_to_pwm(v_right)
 
-        # Left track
-        GPIO.output(self.IN1, GPIO.HIGH if left_dir > 0 else GPIO.LOW)
-        GPIO.output(self.IN2, GPIO.LOW if left_dir > 0 else GPIO.HIGH)
-
-        # Right track
-        GPIO.output(self.IN3, GPIO.HIGH if right_dir > 0 else GPIO.LOW)
-        GPIO.output(self.IN4, GPIO.LOW if right_dir > 0 else GPIO.HIGH)
-
-        self.left_pwm.ChangeDutyCycle(left_duty)
-        self.right_pwm.ChangeDutyCycle(right_duty)
+        # Use the hardware abstraction layer to actually set pins/PWM
+        try:
+            self.hw.set_motor(left_duty, left_dir, right_duty, right_dir)
+        except Exception as e:
+            LOG.warning("Failed to set motor outputs: %s", e)
 
     # --------------------------------------------------
 
     def destroy_node(self):
-        self._set_motor_outputs(0.0, 0.0)
-        if GPIO_AVAILABLE:
-            self.left_pwm.stop()
-            self.right_pwm.stop()
-            GPIO.cleanup()
+        try:
+            self._set_motor_outputs(0.0, 0.0)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "hw"):
+                self.hw.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "audit"):
+                self.audit.close()
+        except Exception:
+            pass
         super().destroy_node()
 
 
