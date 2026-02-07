@@ -110,13 +110,15 @@ Battery – to GND on both boards (make a 3-sided jumper wire **OR** use a bread
 
 **One way to do this is to make two three-ended jumper cables and connect one end of each to a third three-ended jumper cable.**  
 
-**Then connect**:
-One end (the main stem) to the 3.3V pin on the Pi 
+**Then connect**:  
 
-**Then connect the remaining four ends**:
-One end to VCC on motor MOTOR DRIVER 1 
-One end to STBY on MOTOR DRIVER 1 
-One end to VCC on MOTOR DRIVER 2
-One end to STBY on MOTOR DRIVER 2
+One end (the main stem) to the 3.3V pin on the Pi  
+
+**Then connect the remaining four ends**:  
+
+One end to VCC on motor MOTOR DRIVER 1  
+One end to STBY on MOTOR DRIVER 1  
+One end to VCC on MOTOR DRIVER 2  
+One end to STBY on MOTOR DRIVER 2  
 
 
