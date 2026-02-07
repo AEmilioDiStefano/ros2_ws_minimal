@@ -1,8 +1,8 @@
 # GPIO connections from Raspberry Pi 4 to DUAL Tb6612fng motor controllers to motors for a TANK TRACK DIFFERENTIAL DRIVE Chassis  
 
 ### **This version wires each SIDE as a paired set**:  
-###   - Left Front + Left Rear receive the SAME PWM + direction signals  
-###   - Right Front + Right Rear receive the SAME PWM + direction signals  
+###   - Left Front and Left Rear receive the SAME PWM and direction signals  
+###   - Right Front and Right Rear receive the SAME PWM and direction signals  
 ###   This prevents motors from fighting each other in a tank-style track system.  
 
 #  
