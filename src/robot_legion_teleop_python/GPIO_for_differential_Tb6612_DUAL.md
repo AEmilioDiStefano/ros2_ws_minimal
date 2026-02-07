@@ -151,7 +151,7 @@ Add a fuse holder (with a 5 amp fuse inside) and an ON/OFF switch to your circui
 
 Connect the longer wire (the positive side) of the LED to either side of the resistor  
 
-**Then connect the LED and resistor to the circuit**  
+**Then connect the LED and resistor to the circuit**:  
 
 Connect the free end of the resistor to the positive side of the circuit (after the fise holder and the ON/OFF switch, and before everything else)  
 
