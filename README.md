@@ -432,6 +432,14 @@ cd ros2_ws
 
 <br>
 
+**Now Build**:
+
+```shell
+colcon build
+```
+
+<br>  
+
 **In both terminals**, enter the following command:
 
 ```shell
