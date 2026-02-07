@@ -283,25 +283,21 @@ sudo apt install -y python3-rpi.gpio python3-opencv \
 
 ## 5.3 Set Up ROS2 networking between your laptop and your Pi
 <br>
-Add these lines to the .bashrc file of both machines (Laptop and Pi):
+Enter these commands to add lines to your .bashrc file (Laptop and Pi):  
 
 ```shell
-# ROS 2 Jazzy
-source /opt/ros/jazzy/setup.bash
-
-# Same domain for laptop and Pi
-export ROS_DOMAIN_ID=17
-
-# Allow DDS to use the network (not localhost only)
-export ROS_LOCALHOST_ONLY=0
-
+echo 'source /opt/ros/jazzy/setup.bash' >> ~/.bashrc
+source ~/.bashrc
 ```
 
-Then source .bashrc
+```shell
+echo 'export ROS_DOMAIN_ID=17' >> ~/.bashrc
+source ~/.bashrc
+```
 
 ```shell
+echo 'export ROS_LOCALHOST_ONLY=0' >> ~/.bashrc
 source ~/.bashrc
-
 ```
 
 <br>
