@@ -160,5 +160,3 @@ Connect the free side of the LED to the negative side of the circuit (right befo
 
 
 
-
-
