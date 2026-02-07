@@ -4,11 +4,52 @@ defaults:
   drive_profile: drive_diff
   hardware_profile: hbridge_2ch
 
+# ------------------------------------------------------------------------------
+# Params Reference (supported keys)
+#
+# drive_profiles.*.params:
+#   wheel_base_m              (float)  Wheel base / separation used by diff-drive math
+#   track_width_m             (float)  Omni/mecanum track width (future use)
+#   max_linear_mps            (float)  Max linear speed clamp
+#   max_angular_rps           (float)  Max angular speed clamp
+#   watchdog_timeout_s        (float)  Motor driver cmd timeout
+#   spin_speed_mult           (float)  Tank-spin speed multiplier (0..1)
+#   stall_timeout_s           (float)  Time allowed above stall_duty_pct before cutting output
+#   stall_duty_pct            (float)  Duty threshold considered "stalled"
+#   teleop_linear_mps         (float)  Teleop base linear speed
+#   teleop_angular_rps        (float)  Teleop base angular speed
+#   teleop_speed_step         (float)  Teleop speed step multiplier
+#   teleop_medium_steps       (int)    Steps from base to medium
+#   teleop_fast_linear_steps  (int)    Steps from base to fast linear
+#   teleop_fast_angular_steps (int)    Steps from base to fast angular
+#   teleop_omni_turn_gain     (float)  Omni circle-turn angular gain (multiplies angular speed)
+#   teleop_smoothing_alpha    (float)  Twist smoothing factor (0=off, 1=very smooth)
+#   fpv_lease_ttl_sec         (float)  FPV claim lease TTL
+#
+# hardware_profiles.*.params:
+#   pwm_hz   (int)   PWM frequency
+#   max_pwm  (int)   PWM duty cap (0..100)
+#   pwm_ramp_ms       (float) Soft-start ramp time for 0->100% duty
+#   pwm_deadband_pct  (float) Duty below this is treated as 0
+#   cmd_rate_hz       (float) Max motor command update rate (0 = no limit)
+#   pwm_slew_pct_per_s (float) Max duty change per second (0 = no limit)
+#
+# robots.*.params (per-robot overrides):
+#   drive: { ... any drive params above ... }
+#   hardware: { ... any hardware params above ... }
+# ------------------------------------------------------------------------------
+
 robots:
   # Differential-drive robots
   robot1:
     drive_profile: drive_diff
     hardware_profile: tb6612_diff_dual
+    params:
+      drive:
+        # Snappy but safe starting values for tank-track TB6612 setup
+        stall_timeout_s: 1.0
+        stall_duty_pct: 75
+        teleop_smoothing_alpha: 0.25
 
   robot2:
     drive_profile: drive_omni
@@ -17,6 +58,13 @@ robots:
   robot3:
     drive_profile: drive_diff
     hardware_profile: hbridge_2ch
+    params:
+      drive:
+        max_linear_mps: 0.3
+        max_angular_rps: 1.5
+      hardware:
+        pwm_hz: 2000
+        max_pwm: 80
 
   # Omni robot (TB6612 x2)
   robot_omni:
@@ -27,19 +75,53 @@ drive_profiles:
   drive_diff:
     type: diff_drive
     params:
-      # These are available for future tuning, even if not used in the simple mixer yet.
-      wheel_base_m: 0.22
-      max_linear_mps: 0.5
-      max_angular_rps: 1.0
+      # Primary drive constraints
+      wheel_base_m: 0.18
+      max_linear_mps: 0.4
+      max_angular_rps: 2.0
+      watchdog_timeout_s: 0.5
+      spin_speed_mult: 0.7
+      stall_timeout_s: 1.5
+      stall_duty_pct: 70
+
+      # Teleop defaults (keyboard)
+      teleop_linear_mps: 0.5
+      teleop_angular_rps: 1.0
+      teleop_speed_step: 1.1
+      teleop_medium_steps: 10
+      teleop_fast_linear_steps: 15
+      teleop_fast_angular_steps: 10
+      teleop_omni_turn_gain: 0.5
+      teleop_smoothing_alpha: 0.0
+
+      # FPV defaults
+      fpv_lease_ttl_sec: 3.0
 
   drive_omni:
     type: omni
     params:
       # These are placeholders for future "proper kinematics" if you want it.
-      wheel_base_m: 0.22
+      wheel_base_m: 0.18
       track_width_m: 0.18
-      max_linear_mps: 0.5
-      max_angular_rps: 1.0
+      max_linear_mps: 0.4
+      max_angular_rps: 2.0
+      watchdog_timeout_s: 0.5
+      spin_speed_mult: 0.7
+      stall_timeout_s: 1.5
+      stall_duty_pct: 70
+
+      # Teleop defaults (keyboard)
+      teleop_linear_mps: 0.5
+      teleop_angular_rps: 1.0
+      teleop_speed_step: 1.1
+      teleop_medium_steps: 10
+      teleop_fast_linear_steps: 15
+      teleop_fast_angular_steps: 10
+      teleop_omni_turn_gain: 0.5
+      teleop_smoothing_alpha: 0.0
+
+      # FPV defaults
+      fpv_lease_ttl_sec: 3.0
 
 hardware_profiles:
   # --------------------------------------------------------------------------
@@ -66,6 +148,13 @@ hardware_profiles:
       en_right: 13
       in1_right: 22
       in2_right: 23
+    params:
+      pwm_hz: 1000
+      max_pwm: 100
+      pwm_ramp_ms: 0
+      pwm_deadband_pct: 0
+      cmd_rate_hz: 0
+      pwm_slew_pct_per_s: 0
 
   # --------------------------------------------------------------------------
   # Omni: two TB6612 boards (4 motor channels)
@@ -101,6 +190,13 @@ hardware_profiles:
       fr_pwm: 13
       fr_in1: 16
       fr_in2: 19
+    params:
+      pwm_hz: 1000
+      max_pwm: 100
+      pwm_ramp_ms: 0
+      pwm_deadband_pct: 0
+      cmd_rate_hz: 0
+      pwm_slew_pct_per_s: 0
 
   # Differential-drive wiring using TWO TB6612 boards (left and right pairs)
   # Specific to paired-motor tank-style setups:
@@ -120,6 +216,13 @@ hardware_profiles:
       fr_pwm: 18
       fr_in1: 23
       fr_in2: 24
+    params:
+      pwm_hz: 1000
+      max_pwm: 100
+      pwm_ramp_ms: 250
+      pwm_deadband_pct: 5
+      cmd_rate_hz: 30
+      pwm_slew_pct_per_s: 0
 
     # If physical wiring yields reversed polarity, set these flags per-robot
     # invert_left: false

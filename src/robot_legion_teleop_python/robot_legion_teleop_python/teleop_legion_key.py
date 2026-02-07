@@ -55,6 +55,7 @@ from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 
 from .audit_logger import AuditLogger
+from .drive_profiles import load_profile_registry, resolve_robot_profile
 
 
 CMD_VEL_RE = re.compile(r"^/([^/]+)/cmd_vel$")
@@ -116,9 +117,52 @@ class RobotLegionTeleop(Node):
         # Timer to refresh heartbeat discovery and to expire stale entries
         self.create_timer(1.0, self._refresh_heartbeats)
 
+        # Profile registry (optional)
+        self.declare_parameter("profiles_path", "")
+        profiles_path = str(self.get_parameter("profiles_path").value).strip() or None
+        self._profile_registry = None
+        try:
+            self._profile_registry = load_profile_registry(profiles_path)
+        except Exception as ex:
+            self.get_logger().warning(f"[teleop] Failed to load profile registry: {ex}")
+
+        # Defaults from YAML (ROS params still override)
+        drive_defaults = self._get_default_drive_params()
+        wheel_sep_default = (
+            drive_defaults.get("wheel_separation_m")
+            or drive_defaults.get("wheel_base_m")
+            or 0.18
+        )
+        teleop_lin_default = drive_defaults.get("teleop_linear_mps") or 0.5
+        teleop_ang_default = drive_defaults.get("teleop_angular_rps") or 1.0
+        teleop_step_default = drive_defaults.get("teleop_speed_step") or 1.1
+        teleop_medium_steps = int(drive_defaults.get("teleop_medium_steps") or 10)
+        teleop_fast_linear_steps = int(drive_defaults.get("teleop_fast_linear_steps") or 15)
+        teleop_fast_angular_steps = int(drive_defaults.get("teleop_fast_angular_steps") or 10)
+        teleop_omni_turn_gain = float(drive_defaults.get("teleop_omni_turn_gain") or 0.5)
+        teleop_smooth_default = float(drive_defaults.get("teleop_smoothing_alpha") or 0.0)
+
         # Used for circle-turn math (must match motor_driver_node)
-        self.declare_parameter("wheel_separation", 0.18)
+        self.declare_parameter("wheel_separation", float(wheel_sep_default))
         self.wheel_separation = float(self.get_parameter("wheel_separation").value)
+
+        # Teleop tuning parameters (YAML default, ROS overrides)
+        self.declare_parameter("teleop_linear_mps", float(teleop_lin_default))
+        self.declare_parameter("teleop_angular_rps", float(teleop_ang_default))
+        self.declare_parameter("teleop_speed_step", float(teleop_step_default))
+        self.declare_parameter("teleop_medium_steps", int(teleop_medium_steps))
+        self.declare_parameter("teleop_fast_linear_steps", int(teleop_fast_linear_steps))
+        self.declare_parameter("teleop_fast_angular_steps", int(teleop_fast_angular_steps))
+        self.declare_parameter("teleop_omni_turn_gain", float(teleop_omni_turn_gain))
+        self.declare_parameter("teleop_smoothing_alpha", float(teleop_smooth_default))
+
+        # Track whether ROS params were explicitly overridden (best-effort)
+        self._param_overrides = {
+            "wheel_separation": self.wheel_separation != float(wheel_sep_default),
+            "teleop_linear_mps": float(self.get_parameter("teleop_linear_mps").value) != float(teleop_lin_default),
+            "teleop_angular_rps": float(self.get_parameter("teleop_angular_rps").value) != float(teleop_ang_default),
+            "teleop_speed_step": float(self.get_parameter("teleop_speed_step").value) != float(teleop_step_default),
+        }
 
         # Active robot publishers (used by fpv_camera_mux)
         self.active_robot_pub = self.create_publisher(String, "/active_robot", 10)
@@ -129,18 +173,19 @@ class RobotLegionTeleop(Node):
         self.cmd_vel_topic: Optional[str] = None
         self.current_robot_name: Optional[str] = None
 
-        # Speed profile
-        self.linear_speed = 0.5
-        self.angular_speed = 1.0
-        self.speed_step = 1.1
-
-        self.base_slow_linear = self.linear_speed
-        self.base_slow_angular = self.angular_speed
-
-        self.medium_linear = self.base_slow_linear * (self.speed_step ** 10)
-        self.medium_angular = self.base_slow_angular * (self.speed_step ** 10)
-        self.fast_linear = self.base_slow_linear * (self.speed_step ** 15)
-        self.fast_angular = self.base_slow_angular * (self.speed_step ** 10)
+        # Speed profile (defaults from YAML; can be overridden per-robot)
+        self.teleop_omni_turn_gain = float(self.get_parameter("teleop_omni_turn_gain").value)
+        # Smoothing for Twist commands (0=off, 1=very smooth)
+        self.teleop_smoothing_alpha = float(self.get_parameter("teleop_smoothing_alpha").value)
+        self._filtered_twist = Twist()
+        self._set_speed_profile(
+            linear=float(self.get_parameter("teleop_linear_mps").value),
+            angular=float(self.get_parameter("teleop_angular_rps").value),
+            step=float(self.get_parameter("teleop_speed_step").value),
+            medium_steps=int(self.get_parameter("teleop_medium_steps").value),
+            fast_linear_steps=int(self.get_parameter("teleop_fast_linear_steps").value),
+            fast_angular_steps=int(self.get_parameter("teleop_fast_angular_steps").value),
+        )
 
         # Republish state
         self.last_lin_mult = 0.0
@@ -448,6 +493,83 @@ class RobotLegionTeleop(Node):
         self.active_robot_pub.publish(msg)
         self.active_robot_teleop_pub.publish(msg)
 
+    def _get_default_drive_params(self) -> Dict[str, float]:
+        """Return drive params for the default drive profile, if available."""
+        if not self._profile_registry:
+            return {}
+        defaults = self._profile_registry.get("defaults", {}) or {}
+        drive_name = defaults.get("drive_profile")
+        drive_profiles = self._profile_registry.get("drive_profiles", {}) or {}
+        drive = drive_profiles.get(drive_name, {}) if drive_name else {}
+        return drive.get("params", {}) or {}
+
+    def _get_robot_drive_params(self, robot_name: str) -> Dict[str, float]:
+        if not self._profile_registry:
+            return {}
+        try:
+            prof = resolve_robot_profile(self._profile_registry, robot_name)
+            return prof.get("drive_params", {}) or {}
+        except Exception:
+            return {}
+
+    def _set_speed_profile(
+        self,
+        linear: float,
+        angular: float,
+        step: float,
+        medium_steps: int,
+        fast_linear_steps: int,
+        fast_angular_steps: int,
+    ):
+        self.linear_speed = float(linear)
+        self.angular_speed = float(angular)
+        self.speed_step = float(step)
+
+        self.base_slow_linear = self.linear_speed
+        self.base_slow_angular = self.angular_speed
+
+        self.medium_linear = self.base_slow_linear * (self.speed_step ** int(medium_steps))
+        self.medium_angular = self.base_slow_angular * (self.speed_step ** int(medium_steps))
+        self.fast_linear = self.base_slow_linear * (self.speed_step ** int(fast_linear_steps))
+        self.fast_angular = self.base_slow_angular * (self.speed_step ** int(fast_angular_steps))
+
+    def _apply_robot_profile(self, robot_name: str):
+        """Update teleop settings based on YAML for this robot (unless ROS overrides are set)."""
+        drive_params = self._get_robot_drive_params(robot_name)
+        if not drive_params:
+            return
+
+        if not self._param_overrides.get("wheel_separation"):
+            wheel_sep = (
+                drive_params.get("wheel_separation_m")
+                or drive_params.get("wheel_base_m")
+                or self.wheel_separation
+            )
+            self.wheel_separation = float(wheel_sep)
+
+        if any(self._param_overrides.get(k) for k in ("teleop_linear_mps", "teleop_angular_rps", "teleop_speed_step")):
+            return
+
+        teleop_lin = drive_params.get("teleop_linear_mps") or self.linear_speed
+        teleop_ang = drive_params.get("teleop_angular_rps") or self.angular_speed
+        teleop_step = drive_params.get("teleop_speed_step") or self.speed_step
+        teleop_medium_steps = int(drive_params.get("teleop_medium_steps") or 10)
+        teleop_fast_linear_steps = int(drive_params.get("teleop_fast_linear_steps") or 15)
+        teleop_fast_angular_steps = int(drive_params.get("teleop_fast_angular_steps") or 10)
+        teleop_omni_turn_gain = float(drive_params.get("teleop_omni_turn_gain") or self.teleop_omni_turn_gain)
+        teleop_smooth = float(drive_params.get("teleop_smoothing_alpha") or self.teleop_smoothing_alpha)
+
+        self._set_speed_profile(
+            linear=teleop_lin,
+            angular=teleop_ang,
+            step=teleop_step,
+            medium_steps=teleop_medium_steps,
+            fast_linear_steps=teleop_fast_linear_steps,
+            fast_angular_steps=teleop_fast_angular_steps,
+        )
+        self.teleop_omni_turn_gain = teleop_omni_turn_gain
+        self.teleop_smoothing_alpha = teleop_smooth
+
     # ---------------- Topic application ----------------
 
     def _apply_cmd_vel_topic(self, new_topic: str):
@@ -472,6 +594,8 @@ class RobotLegionTeleop(Node):
         self.cmd_vel_topic = new_topic
 
         self._publish_active_robot()
+        if self.current_robot_name:
+            self._apply_robot_profile(self.current_robot_name)
         self._tprint(self.render_instructions(new_topic))
         self._tprint(f"[ACTIVE ROBOT] Now controlling: {self.current_robot_name}")
 
@@ -558,7 +682,20 @@ class RobotLegionTeleop(Node):
         """Publish a Twist command and log to audit trail."""
         if self.publisher_ is None or self.current_robot_name is None:
             return
-        
+
+        # Optional smoothing to avoid harsh command spikes that stress hardware.
+        # We bypass smoothing for explicit stops so the robot can halt immediately.
+        if self.teleop_smoothing_alpha > 0.0:
+            is_stop = abs(twist.linear.x) < 1e-9 and abs(twist.angular.z) < 1e-9
+            if not is_stop:
+                a = max(0.0, min(1.0, float(self.teleop_smoothing_alpha)))
+                self._filtered_twist.linear.x = a * twist.linear.x + (1.0 - a) * self._filtered_twist.linear.x
+                self._filtered_twist.angular.z = a * twist.angular.z + (1.0 - a) * self._filtered_twist.angular.z
+                twist = self._filtered_twist
+            else:
+                # Reset filter on stop to avoid "coasting" after a full stop.
+                self._filtered_twist = Twist()
+
         try:
             self.publisher_.publish(twist)
             # Log to audit trail
@@ -716,16 +853,16 @@ class RobotLegionTeleop(Node):
                             twist = Twist()
                             if key == "7":
                                 twist.linear.x = +S
-                                twist.angular.z = +0.5 * self.angular_speed
+                                twist.angular.z = +self.teleop_omni_turn_gain * self.angular_speed
                             elif key == "9":
                                 twist.linear.x = +S
-                                twist.angular.z = -0.5 * self.angular_speed
+                                twist.angular.z = -self.teleop_omni_turn_gain * self.angular_speed
                             elif key == "1":
                                 twist.linear.x = -S
-                                twist.angular.z = +0.5 * self.angular_speed
+                                twist.angular.z = +self.teleop_omni_turn_gain * self.angular_speed
                             elif key == "3":
                                 twist.linear.x = -S
-                                twist.angular.z = -0.5 * self.angular_speed
+                                twist.angular.z = -self.teleop_omni_turn_gain * self.angular_speed
                             self.last_twist = twist
                             self.is_moving = True
                             self._publish_and_log_twist(twist, f"circle-{key}")

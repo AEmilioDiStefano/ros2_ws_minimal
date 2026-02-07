@@ -23,33 +23,68 @@ class MotorDriverNode(Node):
         self.declare_parameter("robot_name", getpass.getuser())
         self.robot_name = self.get_parameter("robot_name").value.strip() or getpass.getuser()
 
-        # Parameters
-        self.declare_parameter("wheel_separation", 0.18)   # meters
-        self.declare_parameter("max_linear_speed", 0.4)    # m/s
-        self.declare_parameter("max_angular_speed", 2.0)   # rad/s
-        self.declare_parameter("max_pwm", 100)             # percent
-
-        # Topic this robot listens to
-        self.declare_parameter("cmd_vel_topic", f"/{self.robot_name}/cmd_vel")
-        self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value.strip() or f"/{self.robot_name}/cmd_vel"
-
-        # Hardware abstraction - load profile-based GPIO mapping when available
+        # Profile registry path (optional)
         self.declare_parameter("profiles_path", "")
         profiles_path = str(self.get_parameter("profiles_path").value).strip() or None
 
         gpio_map = {}
+        drive_params = {}
+        hw_params = {}
         try:
             reg = load_profile_registry(profiles_path)
             prof = resolve_robot_profile(reg, self.robot_name)
             gpio_map = prof.get("gpio", {}) or {}
+            drive_params = prof.get("drive_params", {}) or {}
+            hw_params = prof.get("hardware_params", {}) or {}
             self.get_logger().info(f"[{self.robot_name}] Loaded GPIO map from profile: {list(gpio_map.keys())}")
         except Exception as ex:
             # Log the exception; drive_profiles.py should have already tried fallbacks.
             self.get_logger().warning(f"[{self.robot_name}] Failed to load profile registry: {ex}")
             self.get_logger().warning(f"[{self.robot_name}] Will run in mock hardware mode. To fix, pass profiles_path parameter or rebuild package.")
 
+        # Parameters (YAML defaults, ROS params override)
+        wheel_sep_default = (
+            drive_params.get("wheel_separation_m")
+            or drive_params.get("wheel_base_m")
+            or 0.18
+        )
+        max_lin_default = drive_params.get("max_linear_mps") or 0.4
+        max_ang_default = drive_params.get("max_angular_rps") or 2.0
+        max_pwm_default = hw_params.get("max_pwm") or 100
+        pwm_hz_default = hw_params.get("pwm_hz") or 1000
+        pwm_ramp_ms_default = hw_params.get("pwm_ramp_ms") or 0
+        pwm_deadband_default = hw_params.get("pwm_deadband_pct") or 0
+        cmd_rate_hz_default = hw_params.get("cmd_rate_hz") or 0
+        pwm_slew_default = hw_params.get("pwm_slew_pct_per_s") or 0
+        timeout_default = drive_params.get("watchdog_timeout_s") or 0.5
+        spin_mult_default = drive_params.get("spin_speed_mult") or 0.7
+        stall_timeout_default = drive_params.get("stall_timeout_s") or 0.0
+        stall_duty_default = drive_params.get("stall_duty_pct") or 0.0
+
+        self.declare_parameter("wheel_separation", float(wheel_sep_default))   # meters
+        self.declare_parameter("max_linear_speed", float(max_lin_default))    # m/s
+        self.declare_parameter("max_angular_speed", float(max_ang_default))   # rad/s
+        self.declare_parameter("max_pwm", int(max_pwm_default))               # percent
+        self.declare_parameter("pwm_hz", int(pwm_hz_default))                 # Hz
+        self.declare_parameter("pwm_ramp_ms", float(pwm_ramp_ms_default))
+        self.declare_parameter("pwm_deadband_pct", float(pwm_deadband_default))
+        self.declare_parameter("cmd_rate_hz", float(cmd_rate_hz_default))
+        self.declare_parameter("pwm_slew_pct_per_s", float(pwm_slew_default))
+        self.declare_parameter("watchdog_timeout_s", float(timeout_default))
+        self.declare_parameter("spin_speed_mult", float(spin_mult_default))
+        self.declare_parameter("stall_timeout_s", float(stall_timeout_default))
+        self.declare_parameter("stall_duty_pct", float(stall_duty_default))
+
+        # Topic this robot listens to
+        self.declare_parameter("cmd_vel_topic", f"/{self.robot_name}/cmd_vel")
+        self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value.strip() or f"/{self.robot_name}/cmd_vel"
+
         # Normalize common profile naming and initialize hardware interface.
         gpio_map = self._normalize_gpio_map(gpio_map)
+        # Pass PWM frequency through the gpio_map for HardwareInterface
+        gpio_map["pwm_hz"] = int(self.get_parameter("pwm_hz").value)
+        gpio_map["pwm_ramp_ms"] = float(self.get_parameter("pwm_ramp_ms").value)
+        gpio_map["pwm_slew_pct_per_s"] = float(self.get_parameter("pwm_slew_pct_per_s").value)
         self.hw = HardwareInterface(gpio_map)
 
         # Subscriber
@@ -62,7 +97,15 @@ class MotorDriverNode(Node):
 
         # Watchdog
         self.last_cmd_time = time.time()
-        self.timeout_sec = 0.5
+        self.last_output_time = 0.0
+        # Stall protection: time-based limiter to avoid grinding motors under load.
+        self._stall_start_time = None
+        self._stall_active = False
+        self._stall_timeout_s = float(self.get_parameter("stall_timeout_s").value)
+        self._stall_duty_pct = float(self.get_parameter("stall_duty_pct").value)
+        self.cmd_rate_hz = float(self.get_parameter("cmd_rate_hz").value)
+        self.min_cmd_period = (1.0 / self.cmd_rate_hz) if self.cmd_rate_hz > 0 else 0.0
+        self.timeout_sec = float(self.get_parameter("watchdog_timeout_s").value)
         self.create_timer(0.1, self._watchdog)
 
         # Audit logging for DIU compliance
@@ -150,7 +193,7 @@ class MotorDriverNode(Node):
         # TANK-SPIN OVERRIDE
         # ===============================
         if abs(v) < 1e-3 and abs(w) > 1e-3:
-            spin_speed = 0.7 * max_lin
+            spin_speed = float(self.get_parameter("spin_speed_mult").value) * max_lin
             direction = 1.0 if w > 0.0 else -1.0
             v_left = -direction * spin_speed
             v_right = +direction * spin_speed
@@ -168,27 +211,54 @@ class MotorDriverNode(Node):
 
     def _watchdog(self):
         if time.time() - self.last_cmd_time > self.timeout_sec:
-            self._set_motor_outputs(0.0, 0.0)
+            self._set_motor_outputs(0.0, 0.0, force=True)
 
     # --------------------------------------------------
 
-    def _set_motor_outputs(self, v_left: float, v_right: float):
+    def _set_motor_outputs(self, v_left: float, v_right: float, force: bool = False):
         # Convert speeds to duty+direction and delegate to hardware interface
         max_lin = float(self.get_parameter("max_linear_speed").value)
         max_pwm = float(self.get_parameter("max_pwm").value)
+        deadband = float(self.get_parameter("pwm_deadband_pct").value)
+        deadband = max(0.0, min(deadband, max_pwm))
+
+        now = time.time()
+        if not force and self.min_cmd_period > 0 and (now - self.last_output_time) < self.min_cmd_period:
+            # Rate-limited: keep watchdog alive but skip output update
+            return
 
         def speed_to_pwm(v):
             ratio = max(-1.0, min(1.0, v / max_lin))
             direction = 1 if ratio >= 0 else -1
             duty = abs(ratio) * max_pwm
+            if duty > 0.0 and duty < deadband:
+                duty = 0.0
             return duty, direction
 
         left_duty, left_dir = speed_to_pwm(v_left)
         right_duty, right_dir = speed_to_pwm(v_right)
 
+        # --- Stall protection (time-based)
+        # If duty is high for too long, cut output to avoid grinding motors or brownouts.
+        if self._stall_timeout_s > 0 and self._stall_duty_pct > 0:
+            high_duty = max(left_duty, right_duty) >= self._stall_duty_pct
+            if high_duty:
+                if self._stall_start_time is None:
+                    self._stall_start_time = now
+                elif (now - self._stall_start_time) >= self._stall_timeout_s:
+                    self._stall_active = True
+            else:
+                # Reset once commanded duty drops below threshold
+                self._stall_start_time = None
+                self._stall_active = False
+
+            if self._stall_active and not force:
+                left_duty, right_duty = 0.0, 0.0
+
         # Use the hardware abstraction layer to actually set pins/PWM
         try:
             self.hw.set_motor(left_duty, left_dir, right_duty, right_dir)
+            self.last_output_time = now
         except Exception as e:
             LOG.warning("Failed to set motor outputs: %s", e)
 
@@ -196,7 +266,8 @@ class MotorDriverNode(Node):
 
     def destroy_node(self):
         try:
-            self._set_motor_outputs(0.0, 0.0)
+            # Soft-stop on shutdown (honors ramp/slew for gentle hardware stop).
+            self._set_motor_outputs(0.0, 0.0, force=True)
         except Exception:
             pass
         try:

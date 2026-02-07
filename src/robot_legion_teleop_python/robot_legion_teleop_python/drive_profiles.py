@@ -147,6 +147,17 @@ def resolve_robot_profile(reg: Dict[str, Any], robot_name: str) -> Dict[str, Any
     drive = drive_profiles[drive_profile_name] or {}
     hw = hardware_profiles[hw_profile_name] or {}
 
+    # Merge params with optional per-robot overrides (if present).
+    drive_params = dict(drive.get("params", {}) or {})
+    hw_params = dict(hw.get("params", {}) or {})
+
+    robot_params = robot_entry.get("params") or {}
+    if isinstance(robot_params, dict):
+        drive_params.update(robot_params.get("drive", {}) or {})
+        hw_params.update(robot_params.get("hardware", {}) or {})
+
+    _validate_params(drive_params, hw_params, drive_profile_name, hw_profile_name)
+
     drive_type = drive.get("type")
     if not drive_type:
         raise ValueError(f"drive_profiles.{drive_profile_name} missing required 'type' field")
@@ -159,4 +170,101 @@ def resolve_robot_profile(reg: Dict[str, Any], robot_name: str) -> Dict[str, Any
         "drive": drive,
         "hw": hw,
         "gpio": hw.get("gpio", {}),
+        "drive_params": drive_params,
+        "hardware_params": hw_params,
+        "robot_params": robot_params if isinstance(robot_params, dict) else {},
     }
+
+
+def _validate_params(drive_params: Dict[str, Any], hw_params: Dict[str, Any], drive_name: str, hw_name: str) -> None:
+    """Basic range checks for common tuning parameters."""
+    def _as_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    def _as_int(v):
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    # Drive params
+    positive_keys = ("wheel_base_m", "wheel_separation_m", "track_width_m", "watchdog_timeout_s", "fpv_lease_ttl_sec")
+    nonneg_keys = ("max_linear_mps", "max_angular_rps", "teleop_linear_mps", "teleop_angular_rps", "teleop_omni_turn_gain")
+    int_nonneg_keys = ("teleop_medium_steps", "teleop_fast_linear_steps", "teleop_fast_angular_steps")
+
+    for k in positive_keys:
+        if k in drive_params:
+            v = _as_float(drive_params.get(k))
+            if v is None or v <= 0:
+                raise ValueError(f"drive_profiles.{drive_name}.params.{k} must be > 0 (got {drive_params.get(k)})")
+
+    for k in nonneg_keys:
+        if k in drive_params:
+            v = _as_float(drive_params.get(k))
+            if v is None or v < 0:
+                raise ValueError(f"drive_profiles.{drive_name}.params.{k} must be >= 0 (got {drive_params.get(k)})")
+
+    if "spin_speed_mult" in drive_params:
+        v = _as_float(drive_params.get("spin_speed_mult"))
+        if v is None or v < 0 or v > 1.0:
+            raise ValueError(f"drive_profiles.{drive_name}.params.spin_speed_mult must be in [0, 1] (got {drive_params.get('spin_speed_mult')})")
+
+    if "stall_timeout_s" in drive_params:
+        v = _as_float(drive_params.get("stall_timeout_s"))
+        if v is None or v < 0:
+            raise ValueError(f"drive_profiles.{drive_name}.params.stall_timeout_s must be >= 0 (got {drive_params.get('stall_timeout_s')})")
+
+    if "stall_duty_pct" in drive_params:
+        v = _as_float(drive_params.get("stall_duty_pct"))
+        if v is None or v < 0 or v > 100:
+            raise ValueError(f"drive_profiles.{drive_name}.params.stall_duty_pct must be in [0, 100] (got {drive_params.get('stall_duty_pct')})")
+
+    if "teleop_speed_step" in drive_params:
+        v = _as_float(drive_params.get("teleop_speed_step"))
+        if v is None or v <= 1.0:
+            raise ValueError(f"drive_profiles.{drive_name}.params.teleop_speed_step must be > 1.0 (got {drive_params.get('teleop_speed_step')})")
+
+    if "teleop_smoothing_alpha" in drive_params:
+        v = _as_float(drive_params.get("teleop_smoothing_alpha"))
+        if v is None or v < 0 or v > 1.0:
+            raise ValueError(f"drive_profiles.{drive_name}.params.teleop_smoothing_alpha must be in [0, 1] (got {drive_params.get('teleop_smoothing_alpha')})")
+
+    for k in int_nonneg_keys:
+        if k in drive_params:
+            v = _as_int(drive_params.get(k))
+            if v is None or v < 0:
+                raise ValueError(f"drive_profiles.{drive_name}.params.{k} must be >= 0 (got {drive_params.get(k)})")
+
+    # Hardware params
+    if "pwm_hz" in hw_params:
+        v = _as_int(hw_params.get("pwm_hz"))
+        if v is None or v <= 0:
+            raise ValueError(f"hardware_profiles.{hw_name}.params.pwm_hz must be > 0 (got {hw_params.get('pwm_hz')})")
+
+    if "max_pwm" in hw_params:
+        v = _as_int(hw_params.get("max_pwm"))
+        if v is None or v < 0 or v > 100:
+            raise ValueError(f"hardware_profiles.{hw_name}.params.max_pwm must be in [0, 100] (got {hw_params.get('max_pwm')})")
+
+    if "pwm_ramp_ms" in hw_params:
+        v = _as_float(hw_params.get("pwm_ramp_ms"))
+        if v is None or v < 0:
+            raise ValueError(f"hardware_profiles.{hw_name}.params.pwm_ramp_ms must be >= 0 (got {hw_params.get('pwm_ramp_ms')})")
+
+    if "pwm_deadband_pct" in hw_params:
+        v = _as_float(hw_params.get("pwm_deadband_pct"))
+        if v is None or v < 0 or v > 100:
+            raise ValueError(f"hardware_profiles.{hw_name}.params.pwm_deadband_pct must be in [0, 100] (got {hw_params.get('pwm_deadband_pct')})")
+
+    if "cmd_rate_hz" in hw_params:
+        v = _as_float(hw_params.get("cmd_rate_hz"))
+        if v is None or v < 0:
+            raise ValueError(f"hardware_profiles.{hw_name}.params.cmd_rate_hz must be >= 0 (got {hw_params.get('cmd_rate_hz')})")
+
+    if "pwm_slew_pct_per_s" in hw_params:
+        v = _as_float(hw_params.get("pwm_slew_pct_per_s"))
+        if v is None or v < 0:
+            raise ValueError(f"hardware_profiles.{hw_name}.params.pwm_slew_pct_per_s must be >= 0 (got {hw_params.get('pwm_slew_pct_per_s')})")

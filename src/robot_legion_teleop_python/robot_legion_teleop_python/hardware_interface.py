@@ -32,6 +32,7 @@ so drive-type code can remain device-agnostic.
 
 from typing import Dict, Optional
 import logging
+import time
 
 try:
     import RPi.GPIO as GPIO  # type: ignore
@@ -54,6 +55,12 @@ class HardwareInterface:
         self.gpio_map = gpio_map or {}
         self.left_pwm = None
         self.right_pwm = None
+        self.pwm_hz = int(self.gpio_map.get("pwm_hz") or 1000)
+        self.pwm_ramp_ms = float(self.gpio_map.get("pwm_ramp_ms") or 0.0)
+        self.pwm_slew_pct_per_s = float(self.gpio_map.get("pwm_slew_pct_per_s") or 0.0)
+        self._cur_left_duty = 0.0
+        self._cur_right_duty = 0.0
+        self._last_update = time.monotonic()
         # Allow per-motor polarity inversion via profile flags. Accept several key names.
         self.invert_left = bool(
             self.gpio_map.get("invert_left")
@@ -106,8 +113,8 @@ class HardwareInterface:
             GPIO.setup(pin, GPIO.OUT)
 
         # PWM channels
-        self.left_pwm = GPIO.PWM(self.gpio_map.get("en_left"), 1000)
-        self.right_pwm = GPIO.PWM(self.gpio_map.get("en_right"), 1000)
+        self.left_pwm = GPIO.PWM(self.gpio_map.get("en_left"), self.pwm_hz)
+        self.right_pwm = GPIO.PWM(self.gpio_map.get("en_right"), self.pwm_hz)
         self.left_pwm.start(0)
         self.right_pwm.start(0)
         self._mock = False
@@ -128,6 +135,35 @@ class HardwareInterface:
         if self.invert_right:
             right_dir = -right_dir
 
+        # Soft-start ramp / slew limiter (limits duty change per call)
+        if (self.pwm_ramp_ms and self.pwm_ramp_ms > 0) or (self.pwm_slew_pct_per_s and self.pwm_slew_pct_per_s > 0):
+            now = time.monotonic()
+            dt = max(0.0, now - self._last_update)
+            self._last_update = now
+            ramp_rate = 0.0
+            if self.pwm_ramp_ms and self.pwm_ramp_ms > 0:
+                ramp_rate = 100.0 / (self.pwm_ramp_ms / 1000.0)
+            slew_rate = float(self.pwm_slew_pct_per_s or 0.0)
+            if ramp_rate and slew_rate:
+                rate_per_sec = min(ramp_rate, slew_rate)
+            else:
+                rate_per_sec = ramp_rate or slew_rate
+
+            max_delta = rate_per_sec * dt if rate_per_sec > 0 else 100.0
+
+            def _ramp(cur, target):
+                if target > cur:
+                    return min(target, cur + max_delta)
+                if target < cur:
+                    return max(target, cur - max_delta)
+                return cur
+
+            self._cur_left_duty = _ramp(self._cur_left_duty, float(left_duty))
+            self._cur_right_duty = _ramp(self._cur_right_duty, float(right_duty))
+        else:
+            self._cur_left_duty = float(left_duty)
+            self._cur_right_duty = float(right_duty)
+
         # left motor pins
         in1 = self.gpio_map.get("in1_left")
         in2 = self.gpio_map.get("in2_left")
@@ -144,9 +180,9 @@ class HardwareInterface:
 
         # set PWM duty
         if self.left_pwm is not None:
-            self.left_pwm.ChangeDutyCycle(max(0.0, min(100.0, float(left_duty))))
+            self.left_pwm.ChangeDutyCycle(max(0.0, min(100.0, float(self._cur_left_duty))))
         if self.right_pwm is not None:
-            self.right_pwm.ChangeDutyCycle(max(0.0, min(100.0, float(right_duty))))
+            self.right_pwm.ChangeDutyCycle(max(0.0, min(100.0, float(self._cur_right_duty))))
 
     def stop(self):
         """Stop motors and cleanup if using real GPIO"""
