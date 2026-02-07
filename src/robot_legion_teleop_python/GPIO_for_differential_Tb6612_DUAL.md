@@ -76,52 +76,47 @@ AIN2 **and** BIN2 tied together → GPIO 24
 #  
 #  
 
-### Common ground (critical)  
+### ADD BATTERIES TO POWER MOTORS  
 
-**All grounds must connect together**:  
+### Common ground
+**All grounds must connect together (critical)**:  
 
-Pi GND to TB6612 GND to Battery – (negative)  
+Pi GND to TB6612 GND (LEFT SIDE)
 
-#  
-#    
-
-### STBY (enable)   
-  
-On TB6612 #1: STBY to VCC (same board)  
-On TB6612 #2: STBY to VCC (same board)  
+Pi GND to TB6612 GND (RIGHT SIDE)
 
 #  
-#  
-
-**Standby (board enable)**  
-
-MOTOR DRIVER 1: STBY to VCC (same motor driver)
-
-MOTOR DRIVER 1: STBY to VCC (same motor driver) 
-
-#  
-#  
-
-### Logic power  
-
-Pi 3.3V to VCC on both TB6612 boards  
-
-Pi GND to GND on both boards  
-
-**(3.3V logic is ideal with Pi GPIO)**
-
-#  
-#  
+#   
 
 ### Motor power  
 
-**If you’re using 2×18650 (2S) pack**:  
+Battery + to VM on both boards (make a 3-sided jumper wire **OR** use a breadboard)  
 
-Battery + to VM on both boards  
-
-Battery – to GND on both boards  
+Battery – to GND on both boards (make a 3-sided jumper wire **OR** use a breadboard)  
 
 #  
-#    
+#   
+
+<br>  
+
+#  
+#  
+
+### COMPLETE THE CIRCUIT
+
+### To complete the circuit, connect STBY and VCC on BOTH MOTOR DRIVERS to the single 3.3V pin on the Raspberry Pi 
+
+**Create a one-to-four jumper cable unless you are using a breadboard**  
+
+**One way to do this is to make two three-ended jumper cables and connect one end of each to a third three-ended jumper cable.**  
+
+**Then connect**:
+One end (the main stem) to the 3.3V pin on the Pi 
+
+**Then connect the remaining four ends**:
+One end to VCC on motor MOTOR DRIVER 1 
+One end to STBY on MOTOR DRIVER 1 
+One end to VCC on MOTOR DRIVER 2
+One end to STBY on MOTOR DRIVER 2
 
 
