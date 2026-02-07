@@ -422,7 +422,13 @@ cd ros2_ws
 git clone https://github.com/AEmilioDiStefano/ros2_ws_minimal.git ros2_ws
 ```
 
+**Now Build**:
 
+```shell
+colcon build
+```
+
+<br> 
 
 **In the other terminal (on your laptop)**, enter your existing ros2_ws directory:
 
@@ -430,15 +436,7 @@ git clone https://github.com/AEmilioDiStefano/ros2_ws_minimal.git ros2_ws
 cd ros2_ws
 ```
 
-<br>
-
-**Now Build**:
-
-```shell
-colcon build
-```
-
-<br>  
+<br> 
 
 **In both terminals**, enter the following command:
 
