@@ -1,6 +1,14 @@
 # GPIO connections from Raspberry Pi 4 to DUAL Tb6612fng motor controllers to motors for a TANK TRACK DIFFERENTIAL DRIVE Chassis  
 
-### TB6612 #1 — LEFT SIDE MOTORS  
+### **This version wires each SIDE as a paired set**:  
+###   - Left Front + Left Rear receive the SAME PWM + direction signals  
+###   - Right Front + Right Rear receive the SAME PWM + direction signals  
+###   - This prevents motors from fighting each other in a tank-style track system.  
+
+#  
+#  
+
+### TB6612 #1 - LEFT SIDE MOTORS (paired together)  
 
 **Left Front Motor (Channel A)**  
 
@@ -10,14 +18,6 @@ Motor + to A01
 
 Motor − to A02  
 
-**GPIO connections**  
-
-PWMA to GPIO 12 (PWM)  
-
-AIN1 to GPIO 5  
-
-AIN2 to GPIO 6  
-
 **Left Rear Motor (Channel B)**  
 
 **Motor wires**  
@@ -26,24 +26,22 @@ Motor + to B01
 
 Motor − to B02  
 
-**GPIO connections**  
+**GPIO connections (tied so BOTH channels get identical commands)**  
 
-PWMB to GPIO 13 (PWM)  
+PWMA **and** PWMB tied together → GPIO 12 (PWM)  
 
-BIN1 to GPIO 16  
+AIN1 **and** BIN1 tied together → GPIO 5  
 
-BIN2 to GPIO 20  
+AIN2 **and** BIN2 tied together → GPIO 6  
 
 **Standby (board enable)**  
 
-STBY to GPIO 21  
+STBY to 3.3V (VCC) **OR** STBY to a single GPIO (see STBY section below)  
 
-**(or tie to 3.3V if you never want software disable)**  
+#  
+##  
 
-<br>  
-<br>  
-
-### TB6612 #2 — RIGHT SIDE MOTORS  
+### TB6612 #2 - RIGHT SIDE MOTORS (paired together)  
 
 **Right Front Motor (Channel A)**  
 
@@ -53,14 +51,6 @@ Motor + to A01
 
 Motor − to A02   
 
-**GPIO connections**  
-
-PWMA to GPIO 18 (PWM)  
-
-AIN1 to GPIO 23  
-
-AIN2 to GPIO 24  
-
 **Right Rear Motor (Channel B)**  
 
 **Motor wires**  
@@ -69,21 +59,20 @@ Motor + to B01
 
 Motor − to B02  
 
-**GPIO connections**  
+**GPIO connections (tied so BOTH channels get identical commands)**  
 
-PWMB to GPIO 19 (PWM)  
+PWMA **and** PWMB tied together → GPIO 18 (PWM)  
 
-BIN1 to GPIO 25  
+AIN1 **and** BIN1 tied together → GPIO 23  
 
-BIN2 to GPIO 8  
+AIN2 **and** BIN2 tied together → GPIO 24  
 
 **Standby (board enable)**  
 
-STBY to GPIO 7  
-**(you may also tie both STBY pins together and drive them from ONE GPIO if desired)**  
+STBY to 3.3V (VCC) **OR** STBY to a single GPIO (see STBY section below)  
 
-<br>  
-<br>  
+#  
+#  
 
 ### Logic power  
 
@@ -93,7 +82,8 @@ Pi GND to GND on both boards
 
 **(3.3V logic is ideal with Pi GPIO)**
 
-<br>  
+#  
+#  
 
 ### Motor power  
 
@@ -103,7 +93,8 @@ Battery + to VM on both boards
 
 Battery – to GND on both boards  
 
-<br>  
+#  
+#    
 
 ### Common ground (critical)  
 
@@ -111,12 +102,17 @@ Battery – to GND on both boards
 
 Pi GND to TB6612 GND to Battery – (negative)  
 
-<br>  
+#  
+#    
 
 ### STBY (enable)  
 
-**For simplest wiring**:  
+**Choose ONE of these options (do not do both):**  
 
+**Option A (simplest, always enabled):**  
 On TB6612 #1: STBY to VCC (same board)  
-
 On TB6612 #2: STBY to VCC (same board)  
+
+**Option B (software enable/disable):**  
+Tie both STBY pins together and drive them from ONE GPIO  
+Example: both STBY → GPIO 21  
