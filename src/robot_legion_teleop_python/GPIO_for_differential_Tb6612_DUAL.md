@@ -36,7 +36,7 @@ AIN2 **and** BIN2 tied together → GPIO 6
 
 **Standby (board enable)**  
 
-STBY to 3.3V (VCC) **OR** STBY to a single GPIO (see STBY section below)  
+STBY to VCC (same motor driver)
 
 #  
 ##  
@@ -69,7 +69,7 @@ AIN2 **and** BIN2 tied together → GPIO 24
 
 **Standby (board enable)**  
 
-STBY to 3.3V (VCC) **OR** STBY to a single GPIO (see STBY section below)  
+STBY to VCC (same motor driver)  
 
 #  
 #  
@@ -105,14 +105,9 @@ Pi GND to TB6612 GND to Battery – (negative)
 #  
 #    
 
-### STBY (enable)  
-
-**Choose ONE of these options (do not do both):**  
-
-**Option A (simplest, always enabled):**  
+### STBY (enable)   
+  
 On TB6612 #1: STBY to VCC (same board)  
 On TB6612 #2: STBY to VCC (same board)  
 
-**Option B (software enable/disable):**  
-Tie both STBY pins together and drive them from ONE GPIO  
-Example: both STBY → GPIO 21  
+
