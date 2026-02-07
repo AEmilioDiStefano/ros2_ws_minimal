@@ -34,12 +34,13 @@ AIN1 **and** BIN1 tied together → GPIO 5
 
 AIN2 **and** BIN2 tied together → GPIO 6  
 
-**Standby (board enable)**  
+#  
+#  
 
-STBY to VCC (same motor driver)
+<br>  
 
 #  
-##  
+#  
 
 ### TB6612 #2 - RIGHT SIDE MOTORS (paired together)  
 
@@ -67,9 +68,36 @@ AIN1 **and** BIN1 tied together → GPIO 23
 
 AIN2 **and** BIN2 tied together → GPIO 24  
 
+#  
+#  
+
+<br>  
+
+#  
+#  
+
+### Common ground (critical)  
+
+**All grounds must connect together**:  
+
+Pi GND to TB6612 GND to Battery – (negative)  
+
+#  
+#    
+
+### STBY (enable)   
+  
+On TB6612 #1: STBY to VCC (same board)  
+On TB6612 #2: STBY to VCC (same board)  
+
+#  
+#  
+
 **Standby (board enable)**  
 
-STBY to VCC (same motor driver)  
+MOTOR DRIVER 1: STBY to VCC (same motor driver)
+
+MOTOR DRIVER 1: STBY to VCC (same motor driver) 
 
 #  
 #  
@@ -87,7 +115,7 @@ Pi GND to GND on both boards
 
 ### Motor power  
 
-**If you’re using your 2×18650 (2S) pack**:  
+**If you’re using 2×18650 (2S) pack**:  
 
 Battery + to VM on both boards  
 
@@ -95,19 +123,5 @@ Battery – to GND on both boards
 
 #  
 #    
-
-### Common ground (critical)  
-
-**All grounds must connect together**:  
-
-Pi GND to TB6612 GND to Battery – (negative)  
-
-#  
-#    
-
-### STBY (enable)   
-  
-On TB6612 #1: STBY to VCC (same board)  
-On TB6612 #2: STBY to VCC (same board)  
 
 
