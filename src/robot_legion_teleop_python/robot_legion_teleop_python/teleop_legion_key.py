@@ -164,6 +164,7 @@ class RobotLegionTeleop(Node):
             "teleop_linear_mps": float(self.get_parameter("teleop_linear_mps").value) != float(teleop_lin_default),
             "teleop_angular_rps": float(self.get_parameter("teleop_angular_rps").value) != float(teleop_ang_default),
             "teleop_speed_step": float(self.get_parameter("teleop_speed_step").value) != float(teleop_step_default),
+            "teleop_publish_hz": float(self.get_parameter("teleop_publish_hz").value) != float(teleop_publish_hz_default),
         }
 
         # Active robot publishers (used by fpv_camera_mux)
@@ -184,6 +185,7 @@ class RobotLegionTeleop(Node):
         self.teleop_publish_hz = float(self.get_parameter("teleop_publish_hz").value)
         self._desired_twist = Twist()
         self._desired_desc = "init"
+
         self._set_speed_profile(
             linear=float(self.get_parameter("teleop_linear_mps").value),
             angular=float(self.get_parameter("teleop_angular_rps").value),
@@ -564,8 +566,8 @@ class RobotLegionTeleop(Node):
         teleop_fast_linear_steps = int(drive_params.get("teleop_fast_linear_steps") or 15)
         teleop_fast_angular_steps = int(drive_params.get("teleop_fast_angular_steps") or 10)
         teleop_omni_turn_gain = float(drive_params.get("teleop_omni_turn_gain") or self.teleop_omni_turn_gain)
-        teleop_smooth = float(drive_params.get("teleop_smoothing_alpha") or self.teleop_smoothing_alpha)
         teleop_publish_hz = float(drive_params.get("teleop_publish_hz") or self.teleop_publish_hz)
+        teleop_smooth = float(drive_params.get("teleop_smoothing_alpha") or self.teleop_smoothing_alpha)
 
         self._set_speed_profile(
             linear=teleop_lin,
