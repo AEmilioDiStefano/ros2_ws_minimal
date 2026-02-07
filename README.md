@@ -410,19 +410,19 @@ sudo apt install -y ros-jazzy-v4l2-camera
 
 **In one terminal**, SSH into your robot's Raspberry Pi
 
-**Now enter the newly cloned ros2_ws directory**:
-
-```shell
-cd ros2_ws
-```
-
-**IF YOU DO NOT HAVE THIS DIRECTORY**, clone **the minimal version of the ros2_ws workspace** onto your Pi:
+**IF YOU DO NOT HAVE THIS DIRECTORY** on your Pi, clone **the minimal version of the ros2_ws workspace** onto your Pi:
 
 ```shell
 git clone https://github.com/AEmilioDiStefano/ros2_ws_minimal.git ros2_ws
 ```
 
-**Now Build**:
+**Now enter the ros2_ws directory**:
+
+```shell
+cd ros2_ws
+```
+
+**Build**:
 
 ```shell
 colcon build
@@ -430,7 +430,7 @@ colcon build
 
 <br> 
 
-**In the other terminal (on your laptop)**, enter your existing ros2_ws directory:
+**In the OTHER TERMINAL (on your laptop)**, enter your existing ros2_ws directory:
 
 ```shell
 cd ros2_ws
