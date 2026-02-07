@@ -47,9 +47,9 @@ robots:
     params:
       drive:
         # Snappy but safe starting values for tank-track TB6612 setup
-        stall_timeout_s: 1.0
-        stall_duty_pct: 75
-        teleop_smoothing_alpha: 0.25
+        stall_timeout_s: 0
+        stall_duty_pct: 0
+        teleop_smoothing_alpha: 0.0
 
   robot2:
     drive_profile: drive_omni
@@ -81,8 +81,8 @@ drive_profiles:
       max_angular_rps: 2.0
       watchdog_timeout_s: 0.5
       spin_speed_mult: 0.7
-      stall_timeout_s: 1.5
-      stall_duty_pct: 70
+      stall_timeout_s: 0
+      stall_duty_pct: 0
 
       # Teleop defaults (keyboard)
       teleop_linear_mps: 0.5
@@ -107,8 +107,8 @@ drive_profiles:
       max_angular_rps: 2.0
       watchdog_timeout_s: 0.5
       spin_speed_mult: 0.7
-      stall_timeout_s: 1.5
-      stall_duty_pct: 70
+      stall_timeout_s: 0
+      stall_duty_pct: 0
 
       # Teleop defaults (keyboard)
       teleop_linear_mps: 0.5
@@ -219,9 +219,9 @@ hardware_profiles:
     params:
       pwm_hz: 1000
       max_pwm: 100
-      pwm_ramp_ms: 250
-      pwm_deadband_pct: 5
-      cmd_rate_hz: 30
+      pwm_ramp_ms: 80
+      pwm_deadband_pct: 2
+      cmd_rate_hz: 0
       pwm_slew_pct_per_s: 0
 
     # If physical wiring yields reversed polarity, set these flags per-robot

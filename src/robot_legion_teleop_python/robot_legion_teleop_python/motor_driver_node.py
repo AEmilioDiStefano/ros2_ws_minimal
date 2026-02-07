@@ -98,6 +98,7 @@ class MotorDriverNode(Node):
         # Watchdog
         self.last_cmd_time = time.time()
         self.last_output_time = 0.0
+        self._last_commanded = None  # (left_duty, left_dir, right_duty, right_dir)
         # Stall protection: time-based limiter to avoid grinding motors under load.
         self._stall_start_time = None
         self._stall_active = False
@@ -222,11 +223,6 @@ class MotorDriverNode(Node):
         deadband = float(self.get_parameter("pwm_deadband_pct").value)
         deadband = max(0.0, min(deadband, max_pwm))
 
-        now = time.time()
-        if not force and self.min_cmd_period > 0 and (now - self.last_output_time) < self.min_cmd_period:
-            # Rate-limited: keep watchdog alive but skip output update
-            return
-
         def speed_to_pwm(v):
             ratio = max(-1.0, min(1.0, v / max_lin))
             direction = 1 if ratio >= 0 else -1
@@ -237,6 +233,21 @@ class MotorDriverNode(Node):
 
         left_duty, left_dir = speed_to_pwm(v_left)
         right_duty, right_dir = speed_to_pwm(v_right)
+
+        now = time.time()
+        if not force and self.min_cmd_period > 0 and (now - self.last_output_time) < self.min_cmd_period:
+            # If a NEW command arrives quickly, we still apply it immediately
+            # so the most recent command always wins (no ambiguity).
+            last = self._last_commanded
+            changed = (
+                last is None
+                or abs(left_duty - last[0]) > 0.5
+                or abs(right_duty - last[2]) > 0.5
+                or left_dir != last[1]
+                or right_dir != last[3]
+            )
+            if not changed:
+                return
 
         # --- Stall protection (time-based)
         # If duty is high for too long, cut output to avoid grinding motors or brownouts.
@@ -259,6 +270,7 @@ class MotorDriverNode(Node):
         try:
             self.hw.set_motor(left_duty, left_dir, right_duty, right_dir)
             self.last_output_time = now
+            self._last_commanded = (left_duty, left_dir, right_duty, right_dir)
         except Exception as e:
             LOG.warning("Failed to set motor outputs: %s", e)
 
