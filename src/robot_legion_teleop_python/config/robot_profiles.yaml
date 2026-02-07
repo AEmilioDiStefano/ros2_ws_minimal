@@ -10,33 +10,36 @@ defaults:
 # drive_profiles.*.params:
 #   wheel_base_m              (float)  Wheel base / separation used by diff-drive math
 #   track_width_m             (float)  Omni/mecanum track width (future use)
-#   max_linear_mps            (float)  Max linear speed clamp
-#   max_angular_rps           (float)  Max angular speed clamp
+#   max_linear_mps            (float)  Max linear speed clamp (higher=faster, lower=safer)
+#   max_angular_rps           (float)  Max angular speed clamp (higher=snappier turns, lower=smoother)
 #   watchdog_timeout_s        (float)  Motor driver cmd timeout
-#   spin_speed_mult           (float)  Tank-spin speed multiplier (0..1)
-#   stall_timeout_s           (float)  Time allowed above stall_duty_pct before cutting output
-#   stall_duty_pct            (float)  Duty threshold considered "stalled"
-#   teleop_linear_mps         (float)  Teleop base linear speed
-#   teleop_angular_rps        (float)  Teleop base angular speed
-#   teleop_speed_step         (float)  Teleop speed step multiplier
-#   teleop_medium_steps       (int)    Steps from base to medium
-#   teleop_fast_linear_steps  (int)    Steps from base to fast linear
-#   teleop_fast_angular_steps (int)    Steps from base to fast angular
-#   teleop_omni_turn_gain     (float)  Omni circle-turn angular gain (multiplies angular speed)
-#   teleop_smoothing_alpha    (float)  Twist smoothing factor (0=off, 1=very smooth)
+#   spin_speed_mult           (float)  Tank-spin speed multiplier (higher=faster spin)
+#   stall_timeout_s           (float)  Time allowed above stall_duty_pct before cutting output (0=off)
+#   stall_duty_pct            (float)  Duty threshold considered "stalled" (higher=less sensitive)
+#   teleop_linear_mps         (float)  Teleop base linear speed (higher=faster, lower=safer)
+#   teleop_angular_rps        (float)  Teleop base angular speed (higher=snappier turns)
+#   teleop_speed_step         (float)  Teleop speed step multiplier (higher=bigger speed jumps)
+#   teleop_medium_steps       (int)    Steps from base to medium (higher=larger medium)
+#   teleop_fast_linear_steps  (int)    Steps from base to fast linear (higher=larger fast)
+#   teleop_fast_angular_steps (int)    Steps from base to fast angular (higher=larger fast)
+#   teleop_omni_turn_gain     (float)  Omni circle-turn angular gain (higher=tighter turns)
+#   teleop_smoothing_alpha    (float)  Twist smoothing factor (higher=smoother, slower response)
+#   teleop_publish_hz         (float)  Teleop publish rate (higher=smoother, more updates)
 #   fpv_lease_ttl_sec         (float)  FPV claim lease TTL
 #
 # hardware_profiles.*.params:
-#   pwm_hz   (int)   PWM frequency
-#   max_pwm  (int)   PWM duty cap (0..100)
-#   pwm_ramp_ms       (float) Soft-start ramp time for 0->100% duty
-#   pwm_deadband_pct  (float) Duty below this is treated as 0
-#   cmd_rate_hz       (float) Max motor command update rate (0 = no limit)
-#   pwm_slew_pct_per_s (float) Max duty change per second (0 = no limit)
+#   pwm_hz   (int)   PWM frequency (higher=quieter, may reduce torque at very high values)
+#   max_pwm  (int)   PWM duty cap (higher=stronger, lower=safer)
+#   pwm_ramp_ms       (float) Soft-start ramp time for 0->100% duty (higher=smoother, slower)
+#   pwm_deadband_pct  (float) Duty below this is treated as 0 (higher=less jitter, less low-speed control)
+#   cmd_rate_hz       (float) Max motor command update rate (higher=more responsive, 0=no limit)
+#   pwm_slew_pct_per_s (float) Max duty change per second (lower=smoother, higher=snappier, 0=no limit)
 #
 # robots.*.params (per-robot overrides):
 #   drive: { ... any drive params above ... }
 #   hardware: { ... any hardware params above ... }
+# To tune a specific robot, add/adjust values under robots.<name>.params.drive or .params.hardware.
+# To change defaults for all robots using a drive profile or hardware profile, edit drive_profiles.*.params or hardware_profiles.*.params.
 # ------------------------------------------------------------------------------
 
 robots:
@@ -93,6 +96,7 @@ drive_profiles:
       teleop_fast_angular_steps: 10
       teleop_omni_turn_gain: 0.5
       teleop_smoothing_alpha: 0.0
+      teleop_publish_hz: 30
 
       # FPV defaults
       fpv_lease_ttl_sec: 3.0
@@ -119,6 +123,7 @@ drive_profiles:
       teleop_fast_angular_steps: 10
       teleop_omni_turn_gain: 0.5
       teleop_smoothing_alpha: 0.0
+      teleop_publish_hz: 30
 
       # FPV defaults
       fpv_lease_ttl_sec: 3.0
