@@ -3,7 +3,7 @@
 ### **This version wires each SIDE as a paired set**:  
 ###   - Left Front + Left Rear receive the SAME PWM + direction signals  
 ###   - Right Front + Right Rear receive the SAME PWM + direction signals  
-###   - This prevents motors from fighting each other in a tank-style track system.  
+###   This prevents motors from fighting each other in a tank-style track system.  
 
 #  
 #  
