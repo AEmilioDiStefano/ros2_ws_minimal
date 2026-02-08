@@ -98,8 +98,8 @@ drive_profiles:
     type: omni
     params:
       # These are placeholders for future "proper kinematics" if you want it.
-      wheel_base_m: 0.18
-      track_width_m: 0.18
+      wheel_base_m: 0.133
+      track_width_m: 0.12
       max_linear_mps: 0.4
       max_angular_rps: 2.0
       watchdog_timeout_s: 0.5
