@@ -10,6 +10,7 @@ from geometry_msgs.msg import Twist
 
 from .drive_profiles import load_profile_registry, resolve_robot_profile
 from .hardware_interface import HardwareInterface
+from .drive_types import get_drive_type
 from .audit_logger import AuditLogger
 
 LOG = logging.getLogger("motor_driver_node")
@@ -30,12 +31,14 @@ class MotorDriverNode(Node):
         gpio_map = {}
         drive_params = {}
         hw_params = {}
+        self.drive_type = "diff_drive"
         try:
             reg = load_profile_registry(profiles_path)
             prof = resolve_robot_profile(reg, self.robot_name)
             gpio_map = prof.get("gpio", {}) or {}
             drive_params = prof.get("drive_params", {}) or {}
             hw_params = prof.get("hardware_params", {}) or {}
+            self.drive_type = str(prof.get("drive_type") or "diff_drive").lower()
             self.get_logger().info(f"[{self.robot_name}] Loaded GPIO map from profile: {list(gpio_map.keys())}")
         except Exception as ex:
             # Log the exception; drive_profiles.py should have already tried fallbacks.
@@ -48,6 +51,8 @@ class MotorDriverNode(Node):
             or drive_params.get("wheel_base_m")
             or 0.18
         )
+        wheel_base_default = drive_params.get("wheel_base_m") or wheel_sep_default
+        track_width_default = drive_params.get("track_width_m") or wheel_sep_default
         max_lin_default = drive_params.get("max_linear_mps") or 0.4
         max_ang_default = drive_params.get("max_angular_rps") or 2.0
         max_pwm_default = hw_params.get("max_pwm") or 100
@@ -62,6 +67,8 @@ class MotorDriverNode(Node):
         stall_duty_default = drive_params.get("stall_duty_pct") or 0.0
 
         self.declare_parameter("wheel_separation", float(wheel_sep_default))   # meters
+        self.declare_parameter("wheel_base", float(wheel_base_default))       # meters (mecanum)
+        self.declare_parameter("track_width", float(track_width_default))     # meters (mecanum)
         self.declare_parameter("max_linear_speed", float(max_lin_default))    # m/s
         self.declare_parameter("max_angular_speed", float(max_ang_default))   # rad/s
         self.declare_parameter("max_pwm", int(max_pwm_default))               # percent
@@ -86,6 +93,7 @@ class MotorDriverNode(Node):
         gpio_map["pwm_ramp_ms"] = float(self.get_parameter("pwm_ramp_ms").value)
         gpio_map["pwm_slew_pct_per_s"] = float(self.get_parameter("pwm_slew_pct_per_s").value)
         self.hw = HardwareInterface(gpio_map)
+        self.drive = get_drive_type(self.drive_type)
 
         # Subscriber
         self.subscription = self.create_subscription(
@@ -148,7 +156,7 @@ class MotorDriverNode(Node):
             mapped["in2_right"] = gpio_map.get("fr_in2")
             return mapped
 
-        # hbridge_2ch style mapping
+        # L298N_diff (hbridge_2ch) style mapping
         if "en_left" in gpio_map or "in1_left" in gpio_map:
             mapped.update(gpio_map)
             return mapped
@@ -177,9 +185,6 @@ class MotorDriverNode(Node):
         max_lin = float(self.get_parameter("max_linear_speed").value)
         max_ang = float(self.get_parameter("max_angular_speed").value)
 
-        v = max(-max_lin, min(max_lin, msg.linear.x))
-        w = max(-max_ang, min(max_ang, msg.angular.z))
-
         # Log motor command for audit trail
         self.audit.log_command(
             robot=self.robot_name,
@@ -190,23 +195,20 @@ class MotorDriverNode(Node):
             duration_s=time.time() - start_time,
         )
 
-        # ===============================
-        # TANK-SPIN OVERRIDE
-        # ===============================
-        if abs(v) < 1e-3 and abs(w) > 1e-3:
-            spin_speed = float(self.get_parameter("spin_speed_mult").value) * max_lin
-            direction = 1.0 if w > 0.0 else -1.0
-            v_left = -direction * spin_speed
-            v_right = +direction * spin_speed
-            self._set_motor_outputs(v_left, v_right)
-            return
-
-        # ===============================
-        # NORMAL DIFF-DRIVE MODE
-        # ===============================
-        v_left = v - (w * wheel_sep / 2.0)
-        v_right = v + (w * wheel_sep / 2.0)
-        self._set_motor_outputs(v_left, v_right)
+        # Centralized drive-type mixing
+        params = {
+            "wheel_separation": wheel_sep,
+            "wheel_base": float(self.get_parameter("wheel_base").value),
+            "track_width": float(self.get_parameter("track_width").value),
+            "max_linear_speed": max_lin,
+            "max_angular_speed": max_ang,
+            "spin_speed_mult": float(self.get_parameter("spin_speed_mult").value),
+        }
+        cmd = self.drive.mix(msg, params)
+        if cmd.left is not None and cmd.right is not None:
+            self._set_motor_outputs(cmd.left, cmd.right)
+        else:
+            self._set_mecanum_outputs(cmd)
 
     # --------------------------------------------------
 
@@ -273,6 +275,35 @@ class MotorDriverNode(Node):
             self._last_commanded = (left_duty, left_dir, right_duty, right_dir)
         except Exception as e:
             LOG.warning("Failed to set motor outputs: %s", e)
+
+    def _set_mecanum_outputs(self, cmd):
+        """Compute mecanum wheel commands and dispatch to hardware interface.
+
+        This keeps drive-type logic contained in the motor driver, while the
+        HardwareInterface handles the actual pin/PWM outputs.
+        """
+        max_lin = float(self.get_parameter("max_linear_speed").value)
+        max_pwm = float(self.get_parameter("max_pwm").value)
+        deadband = float(self.get_parameter("pwm_deadband_pct").value)
+        deadband = max(0.0, min(deadband, max_pwm))
+
+        def speed_to_pwm(v):
+            ratio = max(-1.0, min(1.0, v / max_lin))
+            direction = 1 if ratio >= 0 else -1
+            duty = abs(ratio) * max_pwm
+            if duty > 0.0 and duty < deadband:
+                duty = 0.0
+            return duty, direction
+
+        fl_d, fl_dir = speed_to_pwm(cmd.fl)
+        fr_d, fr_dir = speed_to_pwm(cmd.fr)
+        rl_d, rl_dir = speed_to_pwm(cmd.rl)
+        rr_d, rr_dir = speed_to_pwm(cmd.rr)
+
+        try:
+            self.hw.set_mecanum(fl_d, fl_dir, fr_d, fr_dir, rl_d, rl_dir, rr_d, rr_dir)
+        except Exception as e:
+            LOG.warning("Failed to set mecanum outputs: %s", e)
 
     # --------------------------------------------------
 

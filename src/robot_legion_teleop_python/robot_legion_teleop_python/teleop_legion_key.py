@@ -141,7 +141,6 @@ class RobotLegionTeleop(Node):
         teleop_fast_angular_steps = int(drive_defaults.get("teleop_fast_angular_steps") or 10)
         teleop_omni_turn_gain = float(drive_defaults.get("teleop_omni_turn_gain") or 0.5)
         teleop_smooth_default = float(drive_defaults.get("teleop_smoothing_alpha") or 0.0)
-        teleop_publish_hz_default = float(drive_defaults.get("teleop_publish_hz") or 30.0)
 
         # Used for circle-turn math (must match motor_driver_node)
         self.declare_parameter("wheel_separation", float(wheel_sep_default))
@@ -156,7 +155,6 @@ class RobotLegionTeleop(Node):
         self.declare_parameter("teleop_fast_angular_steps", int(teleop_fast_angular_steps))
         self.declare_parameter("teleop_omni_turn_gain", float(teleop_omni_turn_gain))
         self.declare_parameter("teleop_smoothing_alpha", float(teleop_smooth_default))
-        self.declare_parameter("teleop_publish_hz", float(teleop_publish_hz_default))
 
         # Track whether ROS params were explicitly overridden (best-effort)
         self._param_overrides = {
@@ -164,7 +162,6 @@ class RobotLegionTeleop(Node):
             "teleop_linear_mps": float(self.get_parameter("teleop_linear_mps").value) != float(teleop_lin_default),
             "teleop_angular_rps": float(self.get_parameter("teleop_angular_rps").value) != float(teleop_ang_default),
             "teleop_speed_step": float(self.get_parameter("teleop_speed_step").value) != float(teleop_step_default),
-            "teleop_publish_hz": float(self.get_parameter("teleop_publish_hz").value) != float(teleop_publish_hz_default),
         }
 
         # Active robot publishers (used by fpv_camera_mux)
@@ -181,11 +178,6 @@ class RobotLegionTeleop(Node):
         # Smoothing for Twist commands (0=off, 1=very smooth)
         self.teleop_smoothing_alpha = float(self.get_parameter("teleop_smoothing_alpha").value)
         self._filtered_twist = Twist()
-        # Fixed-rate publisher: always send the latest desired command.
-        self.teleop_publish_hz = float(self.get_parameter("teleop_publish_hz").value)
-        self._desired_twist = Twist()
-        self._desired_desc = "init"
-
         self._set_speed_profile(
             linear=float(self.get_parameter("teleop_linear_mps").value),
             angular=float(self.get_parameter("teleop_angular_rps").value),
@@ -239,8 +231,7 @@ class RobotLegionTeleop(Node):
         }
 
         # Timers
-        publish_period = 1.0 / self.teleop_publish_hz if self.teleop_publish_hz > 0 else 0.1
-        self._publish_timer = self.create_timer(publish_period, self._publish_latest_twist)
+        self.create_timer(0.1, self._republish_last_twist)
         self.create_timer(0.5, self._offline_watchdog)
 
         # Initial UI
@@ -566,7 +557,6 @@ class RobotLegionTeleop(Node):
         teleop_fast_linear_steps = int(drive_params.get("teleop_fast_linear_steps") or 15)
         teleop_fast_angular_steps = int(drive_params.get("teleop_fast_angular_steps") or 10)
         teleop_omni_turn_gain = float(drive_params.get("teleop_omni_turn_gain") or self.teleop_omni_turn_gain)
-        teleop_publish_hz = float(drive_params.get("teleop_publish_hz") or self.teleop_publish_hz)
         teleop_smooth = float(drive_params.get("teleop_smoothing_alpha") or self.teleop_smoothing_alpha)
 
         self._set_speed_profile(
@@ -579,16 +569,6 @@ class RobotLegionTeleop(Node):
         )
         self.teleop_omni_turn_gain = teleop_omni_turn_gain
         self.teleop_smoothing_alpha = teleop_smooth
-        if teleop_publish_hz != self.teleop_publish_hz:
-            self.teleop_publish_hz = teleop_publish_hz
-            # Recreate timer to apply new publish rate.
-            if hasattr(self, "_publish_timer") and self._publish_timer is not None:
-                try:
-                    self._publish_timer.cancel()
-                except Exception:
-                    pass
-            publish_period = 1.0 / self.teleop_publish_hz if self.teleop_publish_hz > 0 else 0.1
-            self._publish_timer = self.create_timer(publish_period, self._publish_latest_twist)
 
     # ---------------- Topic application ----------------
 
@@ -643,21 +623,25 @@ class RobotLegionTeleop(Node):
         self.last_twist = twist
         self.is_moving = True
 
-        self._desired_twist = twist
-        self._desired_desc = "one-track-circle"
+        self._publish_and_log_twist(twist, "one-track-circle")
 
     # ---------------- Republish + Offline watchdog ----------------
 
-    def _publish_latest_twist(self):
-        """Fixed-rate publisher: always send the latest desired command."""
-        if self.publisher_ is None:
+    def _republish_last_twist(self):
+        if not self.is_moving or self.publisher_ is None:
             return
 
-        if abs(self._desired_twist.linear.x) < 1e-9 and abs(self._desired_twist.angular.z) < 1e-9:
-            if not self.is_moving:
-                return
+        if abs(self.last_twist.linear.x) > 1e-9 or abs(self.last_twist.angular.z) > 1e-9:
+            self._publish_and_log_twist(self.last_twist, "republish")
+            return
 
-        self._publish_and_log_twist(self._desired_twist, self._desired_desc)
+        if self.last_lin_mult == 0.0 and self.last_ang_mult == 0.0:
+            return
+
+        twist = Twist()
+        twist.linear.x = self.linear_speed * self.last_lin_mult
+        twist.angular.z = self.angular_speed * self.last_ang_mult
+        self._publish_and_log_twist(twist, "republish")
 
     def _offline_watchdog(self):
         """
@@ -881,8 +865,7 @@ class RobotLegionTeleop(Node):
                                 twist.angular.z = -self.teleop_omni_turn_gain * self.angular_speed
                             self.last_twist = twist
                             self.is_moving = True
-                            self._desired_twist = twist
-                            self._desired_desc = f"circle-{key}"
+                            self._publish_and_log_twist(twist, f"circle-{key}")
                         continue
 
                     # Normal twist
@@ -895,14 +878,11 @@ class RobotLegionTeleop(Node):
 
                     self.last_twist = twist
                     self.is_moving = True
-                    self._desired_twist = twist
-                    self._desired_desc = "normal-twist"
+                    self._publish_and_log_twist(twist, "normal-twist")
                     continue
 
                 # Stop
                 if key in (" ", "5", "s"):
-                    self._desired_twist = Twist()
-                    self._desired_desc = "stop"
                     self._publish_and_log_twist(Twist(), "stop")
                     self.is_moving = False
                     self.last_lin_mult = 0.0

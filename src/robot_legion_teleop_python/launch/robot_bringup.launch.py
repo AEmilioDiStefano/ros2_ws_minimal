@@ -151,8 +151,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "hardware",
-                default_value="hbridge_2ch",
-                description="Motor driver hardware profile: 'hbridge_2ch', 'tb6612_dual', etc.",
+                default_value="L298N_diff",
+                description="Motor driver hardware profile: 'L298N_diff', 'dual_tb6612_mecanum', etc.",
             ),
             DeclareLaunchArgument(
                 "profiles_path",

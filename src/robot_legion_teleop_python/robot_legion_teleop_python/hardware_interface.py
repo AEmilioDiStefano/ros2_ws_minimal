@@ -60,6 +60,10 @@ class HardwareInterface:
         self.pwm_slew_pct_per_s = float(self.gpio_map.get("pwm_slew_pct_per_s") or 0.0)
         self._cur_left_duty = 0.0
         self._cur_right_duty = 0.0
+        self._cur_fl_duty = 0.0
+        self._cur_fr_duty = 0.0
+        self._cur_rl_duty = 0.0
+        self._cur_rr_duty = 0.0
         self._last_update = time.monotonic()
         # Allow per-motor polarity inversion via profile flags. Accept several key names.
         self.invert_left = bool(
@@ -106,6 +110,18 @@ class HardwareInterface:
             self.gpio_map.get("in2_right"),
             self.gpio_map.get("en_left"),
             self.gpio_map.get("en_right"),
+            self.gpio_map.get("fl_in1"),
+            self.gpio_map.get("fl_in2"),
+            self.gpio_map.get("fr_in1"),
+            self.gpio_map.get("fr_in2"),
+            self.gpio_map.get("rl_in1"),
+            self.gpio_map.get("rl_in2"),
+            self.gpio_map.get("rr_in1"),
+            self.gpio_map.get("rr_in2"),
+            self.gpio_map.get("fl_pwm"),
+            self.gpio_map.get("fr_pwm"),
+            self.gpio_map.get("rl_pwm"),
+            self.gpio_map.get("rr_pwm"),
         ]
         pins = [p for p in pins if p is not None]
 
@@ -113,10 +129,35 @@ class HardwareInterface:
             GPIO.setup(pin, GPIO.OUT)
 
         # PWM channels
-        self.left_pwm = GPIO.PWM(self.gpio_map.get("en_left"), self.pwm_hz)
-        self.right_pwm = GPIO.PWM(self.gpio_map.get("en_right"), self.pwm_hz)
-        self.left_pwm.start(0)
-        self.right_pwm.start(0)
+        if self.gpio_map.get("en_left") is not None and self.gpio_map.get("en_right") is not None:
+            self.left_pwm = GPIO.PWM(self.gpio_map.get("en_left"), self.pwm_hz)
+            self.right_pwm = GPIO.PWM(self.gpio_map.get("en_right"), self.pwm_hz)
+            self.left_pwm.start(0)
+            self.right_pwm.start(0)
+        else:
+            self.left_pwm = None
+            self.right_pwm = None
+
+        if self.gpio_map.get("fl_pwm") is not None:
+            self.fl_pwm = GPIO.PWM(self.gpio_map.get("fl_pwm"), self.pwm_hz)
+            self.fl_pwm.start(0)
+        else:
+            self.fl_pwm = None
+        if self.gpio_map.get("fr_pwm") is not None:
+            self.fr_pwm = GPIO.PWM(self.gpio_map.get("fr_pwm"), self.pwm_hz)
+            self.fr_pwm.start(0)
+        else:
+            self.fr_pwm = None
+        if self.gpio_map.get("rl_pwm") is not None:
+            self.rl_pwm = GPIO.PWM(self.gpio_map.get("rl_pwm"), self.pwm_hz)
+            self.rl_pwm.start(0)
+        else:
+            self.rl_pwm = None
+        if self.gpio_map.get("rr_pwm") is not None:
+            self.rr_pwm = GPIO.PWM(self.gpio_map.get("rr_pwm"), self.pwm_hz)
+            self.rr_pwm.start(0)
+        else:
+            self.rr_pwm = None
         self._mock = False
 
     def set_motor(self, left_duty: float, left_dir: int, right_duty: float, right_dir: int):
@@ -184,6 +225,83 @@ class HardwareInterface:
         if self.right_pwm is not None:
             self.right_pwm.ChangeDutyCycle(max(0.0, min(100.0, float(self._cur_right_duty))))
 
+    def set_mecanum(
+        self,
+        fl_duty: float, fl_dir: int,
+        fr_duty: float, fr_dir: int,
+        rl_duty: float, rl_dir: int,
+        rr_duty: float, rr_dir: int,
+    ):
+        """Set outputs for a 4-channel mecanum/omni drivetrain."""
+        if getattr(self, "_mock", True):
+            LOG.debug(
+                "MOCK set_mecanum: FL(duty=%s,dir=%s) FR(duty=%s,dir=%s) RL(duty=%s,dir=%s) RR(duty=%s,dir=%s)",
+                fl_duty, fl_dir, fr_duty, fr_dir, rl_duty, rl_dir, rr_duty, rr_dir,
+            )
+            return
+
+        # Apply configured polarity inversion if requested by the profile
+        if self.invert_left:
+            fl_dir = -fl_dir
+            rl_dir = -rl_dir
+        if self.invert_right:
+            fr_dir = -fr_dir
+            rr_dir = -rr_dir
+
+        # Soft-start ramp / slew limiter (limits duty change per call)
+        if (self.pwm_ramp_ms and self.pwm_ramp_ms > 0) or (self.pwm_slew_pct_per_s and self.pwm_slew_pct_per_s > 0):
+            now = time.monotonic()
+            dt = max(0.0, now - self._last_update)
+            self._last_update = now
+            ramp_rate = 0.0
+            if self.pwm_ramp_ms and self.pwm_ramp_ms > 0:
+                ramp_rate = 100.0 / (self.pwm_ramp_ms / 1000.0)
+            slew_rate = float(self.pwm_slew_pct_per_s or 0.0)
+            if ramp_rate and slew_rate:
+                rate_per_sec = min(ramp_rate, slew_rate)
+            else:
+                rate_per_sec = ramp_rate or slew_rate
+
+            max_delta = rate_per_sec * dt if rate_per_sec > 0 else 100.0
+
+            def _ramp(cur, target):
+                if target > cur:
+                    return min(target, cur + max_delta)
+                if target < cur:
+                    return max(target, cur - max_delta)
+                return cur
+
+            self._cur_fl_duty = _ramp(self._cur_fl_duty, float(fl_duty))
+            self._cur_fr_duty = _ramp(self._cur_fr_duty, float(fr_duty))
+            self._cur_rl_duty = _ramp(self._cur_rl_duty, float(rl_duty))
+            self._cur_rr_duty = _ramp(self._cur_rr_duty, float(rr_duty))
+        else:
+            self._cur_fl_duty = float(fl_duty)
+            self._cur_fr_duty = float(fr_duty)
+            self._cur_rl_duty = float(rl_duty)
+            self._cur_rr_duty = float(rr_duty)
+
+        # Direction pins
+        def _set_dir(pin1, pin2, direction):
+            if pin1 is None or pin2 is None:
+                return
+            GPIO.output(pin1, GPIO.HIGH if direction > 0 else GPIO.LOW)
+            GPIO.output(pin2, GPIO.LOW if direction > 0 else GPIO.HIGH)
+
+        _set_dir(self.gpio_map.get("fl_in1"), self.gpio_map.get("fl_in2"), fl_dir)
+        _set_dir(self.gpio_map.get("fr_in1"), self.gpio_map.get("fr_in2"), fr_dir)
+        _set_dir(self.gpio_map.get("rl_in1"), self.gpio_map.get("rl_in2"), rl_dir)
+        _set_dir(self.gpio_map.get("rr_in1"), self.gpio_map.get("rr_in2"), rr_dir)
+
+        # PWM duty
+        if self.fl_pwm is not None:
+            self.fl_pwm.ChangeDutyCycle(max(0.0, min(100.0, float(self._cur_fl_duty))))
+        if self.fr_pwm is not None:
+            self.fr_pwm.ChangeDutyCycle(max(0.0, min(100.0, float(self._cur_fr_duty))))
+        if self.rl_pwm is not None:
+            self.rl_pwm.ChangeDutyCycle(max(0.0, min(100.0, float(self._cur_rl_duty))))
+        if self.rr_pwm is not None:
+            self.rr_pwm.ChangeDutyCycle(max(0.0, min(100.0, float(self._cur_rr_duty))))
     def stop(self):
         """Stop motors and cleanup if using real GPIO"""
         if getattr(self, "_mock", True):
@@ -194,6 +312,14 @@ class HardwareInterface:
                 self.left_pwm.stop()
             if self.right_pwm is not None:
                 self.right_pwm.stop()
+            if getattr(self, "fl_pwm", None) is not None:
+                self.fl_pwm.stop()
+            if getattr(self, "fr_pwm", None) is not None:
+                self.fr_pwm.stop()
+            if getattr(self, "rl_pwm", None) is not None:
+                self.rl_pwm.stop()
+            if getattr(self, "rr_pwm", None) is not None:
+                self.rr_pwm.stop()
             GPIO.cleanup()
         except Exception as e:
             LOG.warning("Error cleaning up GPIO: %s", e)

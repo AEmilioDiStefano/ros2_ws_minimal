@@ -72,13 +72,13 @@ defaults:
   max_linear_speed: 0.4   # m/s
 
 drive_profiles:
-  drive_diff:    # Differential drive (2-motor)
+  diff_drive:    # Differential drive (2-motor)
     wheel_separation: 0.18
-  drive_omni:    # Omnidirectional (4-motor mecanum)
+  mecanum_drive:    # Omnidirectional (4-motor mecanum)
     wheel_separation: 0.20
 
 hardware_profiles:
-  hbridge_2ch:   # 2-channel H-bridge relay
+  L298N_diff:   # 2-channel H-bridge relay
     pins:
       en_left: 17
       in1_left: 27
@@ -91,11 +91,11 @@ hardware_profiles:
 
 robots:
   robot1:
-    drive_profile: drive_diff
-    hardware_profile: hbridge_2ch
+    drive_profile: diff_drive
+    hardware_profile: L298N_diff
   robot2:
-    drive_profile: drive_omni
-    hardware_profile: tb6612_dual
+    drive_profile: mecanum_drive
+    hardware_profile: dual_tb6612_mecanum
 ```
 
 **Discovery Modes**:
@@ -222,12 +222,12 @@ On the robot (Pi):
 # Start motor driver + heartbeat (publishes to /<robot>/cmd_vel and /<robot>/heartbeat)
 ros2 launch robot_legion_teleop_python robot_bringup.launch.py \
   drive_type:=diff_drive \
-  hardware:=hbridge_2ch
+  hardware:=L298N_diff
 ```
 
 Parameters:
 - `drive_type`: `diff_drive` (2-motor) or `mecanum` (4-motor)
-- `hardware`: `hbridge_2ch` (H-bridge relay) or `tb6612_dual` (TB6612FNG dual driver), etc.
+- `hardware`: `L298N_diff` (H-bridge relay) or `dual_tb6612_mecanum` (TB6612FNG dual driver), etc.
 - `profiles_path`: Optional custom YAML file path
 - `use_camera`: `true` (default) or `false` to disable USB camera
 
@@ -363,7 +363,7 @@ Create a custom `my_profiles.yaml`:
 ```yaml
 robots:
   my_custom_robot:
-    drive_profile: drive_diff
+    drive_profile: diff_drive
     hardware_profile: custom_tb6612
 
 hardware_profiles:
@@ -394,7 +394,7 @@ If a robot is not in the YAML registry:
 1. **Robot starts** with `drive_type` and `hardware` parameters:
    ```bash
    ros2 launch robot_legion_teleop_python robot_bringup.launch.py \
-     drive_type:=diff_drive hardware:=hbridge_2ch
+     drive_type:=diff_drive hardware:=L298N_diff
    ```
 
 2. **Heartbeat published** as JSON with drive_type/hardware

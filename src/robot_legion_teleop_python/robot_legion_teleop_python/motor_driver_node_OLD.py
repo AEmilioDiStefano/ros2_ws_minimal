@@ -216,7 +216,7 @@ class MotorDriverNode(Node):
 
         self.profile_name = prof["profile_name"]
         self.drive_type = prof["drive_type"]          # diff_drive | mecanum
-        self.hardware = prof["hardware"]              # hbridge_2ch | tb6612_4ch
+        self.hardware = prof["hardware"]              # L298N_diff | tb6612_4ch
         self.profile_params = prof["params"]
         self.profile_gpio = prof["gpio"]
 
@@ -262,11 +262,11 @@ class MotorDriverNode(Node):
     def _make_backend(self) -> MotorBackendBase:
         pwm_hz = int(self.get_parameter("pwm_hz").value)
 
-        if self.hardware == "hbridge_2ch":
+        if self.hardware == "L298N_diff":
             required = ["en_a", "in1", "in2", "in3", "in4", "en_b"]
             for k in required:
                 if k not in self.profile_gpio:
-                    raise ValueError(f"hbridge_2ch missing gpio key: {k}")
+                    raise ValueError(f"L298N_diff missing gpio key: {k}")
             return HBridge2ChBackend(self.profile_gpio, pwm_hz=pwm_hz)
 
         if self.hardware == "tb6612_4ch":
@@ -327,7 +327,7 @@ class MotorDriverNode(Node):
             return
 
         if not isinstance(self.backend, HBridge2ChBackend):
-            self.get_logger().error("Profile mismatch: diff_drive requires hbridge_2ch")
+            self.get_logger().error("Profile mismatch: diff_drive requires L298N_diff")
             return
 
         left_out = self._norm_to_motorout(left_norm)

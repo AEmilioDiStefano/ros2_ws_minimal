@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: LicenseRef-Proprietary
+#
+# ⭐ Relationship to drive_types.py:
+# - This YAML selects each robot's drive_profile + hardware_profile.
+# - drive_types.py uses drive_profile.type to choose the mixing logic for Twist.
 
 defaults:
-  drive_profile: drive_diff
-  hardware_profile: hbridge_2ch
+  drive_profile: diff_drive
+  hardware_profile: L298N_diff
 
 # ------------------------------------------------------------------------------
 # Params Reference (supported keys)
@@ -24,7 +28,6 @@ defaults:
 #   teleop_fast_angular_steps (int)    Steps from base to fast angular
 #   teleop_omni_turn_gain     (float)  Omni circle-turn angular gain (multiplies angular speed)
 #   teleop_smoothing_alpha    (float)  Twist smoothing factor (0=off, 1=very smooth)
-#   teleop_publish_hz         (float)  Teleop publish rate; latest command always wins
 #   fpv_lease_ttl_sec         (float)  FPV claim lease TTL
 #
 # hardware_profiles.*.params:
@@ -43,8 +46,8 @@ defaults:
 robots:
   # Differential-drive robots
   robot1:
-    drive_profile: drive_diff
-    hardware_profile: tb6612_diff_dual
+    drive_profile: diff_drive
+    hardware_profile: dual_tb6612_diff
     params:
       drive:
         # Snappy but safe starting values for tank-track TB6612 setup
@@ -53,27 +56,20 @@ robots:
         teleop_smoothing_alpha: 0.0
 
   robot2:
-    drive_profile: drive_omni
-    hardware_profile: tb6612_dual
+    drive_profile: mecanum_drive
+    hardware_profile: dual_tb6612_mecanum
 
   robot3:
-    drive_profile: drive_diff
-    hardware_profile: hbridge_2ch
-    params:
-      drive:
-        max_linear_mps: 0.3
-        max_angular_rps: 1.5
-      hardware:
-        pwm_hz: 2000
-        max_pwm: 80
+    drive_profile: diff_drive
+    hardware_profile: L298N_diff
 
   # Omni robot (TB6612 x2)
   robot_omni:
-    drive_profile: drive_omni
-    hardware_profile: tb6612_dual
+    drive_profile: mecanum_drive
+    hardware_profile: dual_tb6612_mecanum
 
 drive_profiles:
-  drive_diff:
+  diff_drive:
     type: diff_drive
     params:
       # Primary drive constraints
@@ -94,12 +90,11 @@ drive_profiles:
       teleop_fast_angular_steps: 10
       teleop_omni_turn_gain: 0.5
       teleop_smoothing_alpha: 0.0
-      teleop_publish_hz: 30
 
       # FPV defaults
       fpv_lease_ttl_sec: 3.0
 
-  drive_omni:
+  mecanum_drive:
     type: omni
     params:
       # These are placeholders for future "proper kinematics" if you want it.
@@ -121,7 +116,6 @@ drive_profiles:
       teleop_fast_angular_steps: 10
       teleop_omni_turn_gain: 0.5
       teleop_smoothing_alpha: 0.0
-      teleop_publish_hz: 30
 
       # FPV defaults
       fpv_lease_ttl_sec: 3.0
@@ -142,7 +136,7 @@ hardware_profiles:
   #   left motor  -> ENA + IN1/IN2
   #   right motor -> ENB + IN3/IN4
   # --------------------------------------------------------------------------
-  hbridge_2ch:
+  L298N_diff:
     gpio:
       en_left: 12
       in1_left: 17
@@ -184,7 +178,7 @@ hardware_profiles:
   #     BIN1 → GPIO 23
   #     BIN2 → GPIO 24
   # --------------------------------------------------------------------------
-  tb6612_dual:
+  dual_tb6612_mecanum:
     gpio:
       fl_pwm: 12
       fl_in1: 5
@@ -193,6 +187,14 @@ hardware_profiles:
       fr_pwm: 13
       fr_in1: 16
       fr_in2: 19
+
+      rl_pwm: 18
+      rl_in1: 20
+      rl_in2: 21
+
+      rr_pwm: 26
+      rr_in1: 23
+      rr_in2: 24
     params:
       pwm_hz: 1000
       max_pwm: 100
@@ -206,7 +208,7 @@ hardware_profiles:
   #   Left Front + Left Rear share the SAME signals
   #   Right Front + Right Rear share the SAME signals
   # Matches wiring in GPIO_for_differential_Tb6612_DUAL.md
-  tb6612_diff_dual:
+  dual_tb6612_diff:
     gpio:
       # LEFT side (TB6612 #1)
       # Channel A + B are tied together in hardware to receive identical commands.
