@@ -116,6 +116,7 @@ drive_profiles:
       teleop_fast_angular_steps: 10
       teleop_omni_turn_gain: 0.5
       teleop_smoothing_alpha: 0.0
+      teleop_publish_hz: 25
 
       # FPV defaults
       fpv_lease_ttl_sec: 3.0
@@ -196,12 +197,15 @@ hardware_profiles:
       rr_in1: 23
       rr_in2: 24
     params:
-      pwm_hz: 1000
-      max_pwm: 100
-      pwm_ramp_ms: 0
-      pwm_deadband_pct: 0
+      # EMI/RF mitigation for mecanum:
+      # Lower PWM frequency + gentler ramps reduce switching noise that can
+      # interfere with Wi‑Fi/SSH during heavy lateral motion.
+      pwm_hz: 800
+      max_pwm: 90
+      pwm_ramp_ms: 60
+      pwm_deadband_pct: 1
       cmd_rate_hz: 0
-      pwm_slew_pct_per_s: 0
+      pwm_slew_pct_per_s: 200
 
   # Differential-drive wiring using TWO TB6612 boards (left and right pairs)
   # Specific to paired-motor tank-style setups:
