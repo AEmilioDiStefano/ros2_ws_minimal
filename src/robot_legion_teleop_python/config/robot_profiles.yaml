@@ -20,6 +20,7 @@ defaults:
 #   spin_speed_mult           (float)  Tank-spin speed multiplier (0..1)
 #   stall_timeout_s           (float)  Time allowed above stall_duty_pct before cutting output
 #   stall_duty_pct            (float)  Duty threshold considered "stalled"
+#   linear_accel_mps2         (float)  Linear accel limit (higher=snappier, lower=smoother, 0=off)
 #   teleop_linear_mps         (float)  Teleop base linear speed
 #   teleop_angular_rps        (float)  Teleop base angular speed
 #   teleop_speed_step         (float)  Teleop speed step multiplier
@@ -53,6 +54,7 @@ robots:
         # Snappy but safe starting values for tank-track TB6612 setup
         stall_timeout_s: 0
         stall_duty_pct: 0
+        linear_accel_mps2: 0.8
         teleop_smoothing_alpha: 0.0
 
   robot2:

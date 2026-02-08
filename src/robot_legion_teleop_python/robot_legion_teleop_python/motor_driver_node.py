@@ -65,6 +65,7 @@ class MotorDriverNode(Node):
         spin_mult_default = drive_params.get("spin_speed_mult") or 0.7
         stall_timeout_default = drive_params.get("stall_timeout_s") or 0.0
         stall_duty_default = drive_params.get("stall_duty_pct") or 0.0
+        linear_accel_default = drive_params.get("linear_accel_mps2") or 0.0
 
         self.declare_parameter("wheel_separation", float(wheel_sep_default))   # meters
         self.declare_parameter("wheel_base", float(wheel_base_default))       # meters (mecanum)
@@ -81,6 +82,7 @@ class MotorDriverNode(Node):
         self.declare_parameter("spin_speed_mult", float(spin_mult_default))
         self.declare_parameter("stall_timeout_s", float(stall_timeout_default))
         self.declare_parameter("stall_duty_pct", float(stall_duty_default))
+        self.declare_parameter("linear_accel_mps2", float(linear_accel_default))
 
         # Topic this robot listens to
         self.declare_parameter("cmd_vel_topic", f"/{self.robot_name}/cmd_vel")
@@ -112,6 +114,11 @@ class MotorDriverNode(Node):
         self._stall_active = False
         self._stall_timeout_s = float(self.get_parameter("stall_timeout_s").value)
         self._stall_duty_pct = float(self.get_parameter("stall_duty_pct").value)
+        # Linear acceleration limiting (soft ramp without abrupt jumps)
+        self._linear_accel_mps2 = float(self.get_parameter("linear_accel_mps2").value)
+        self._last_v_left = 0.0
+        self._last_v_right = 0.0
+        self._last_v_time = time.time()
         self.cmd_rate_hz = float(self.get_parameter("cmd_rate_hz").value)
         self.min_cmd_period = (1.0 / self.cmd_rate_hz) if self.cmd_rate_hz > 0 else 0.0
         self.timeout_sec = float(self.get_parameter("watchdog_timeout_s").value)
@@ -206,7 +213,9 @@ class MotorDriverNode(Node):
         }
         cmd = self.drive.mix(msg, params)
         if cmd.left is not None and cmd.right is not None:
-            self._set_motor_outputs(cmd.left, cmd.right)
+            # Rotate commands bypass ramp/deadband for immediate response.
+            is_rotate = abs(cmd.left) > 1e-6 and abs(cmd.right) > 1e-6 and (cmd.left * cmd.right) < 0
+            self._set_motor_outputs(cmd.left, cmd.right, bypass_safety=is_rotate)
         else:
             self._set_mecanum_outputs(cmd)
 
@@ -218,12 +227,31 @@ class MotorDriverNode(Node):
 
     # --------------------------------------------------
 
-    def _set_motor_outputs(self, v_left: float, v_right: float, force: bool = False):
+    def _set_motor_outputs(self, v_left: float, v_right: float, force: bool = False, bypass_safety: bool = False):
         # Convert speeds to duty+direction and delegate to hardware interface
         max_lin = float(self.get_parameter("max_linear_speed").value)
         max_pwm = float(self.get_parameter("max_pwm").value)
         deadband = float(self.get_parameter("pwm_deadband_pct").value)
+        if bypass_safety:
+            deadband = 0.0
         deadband = max(0.0, min(deadband, max_pwm))
+
+        # Optional linear acceleration limiting (soft ramp) for non-rotate commands.
+        if self._linear_accel_mps2 > 0 and not bypass_safety:
+            now = time.time()
+            dt = max(0.0, now - self._last_v_time)
+            self._last_v_time = now
+            max_delta = self._linear_accel_mps2 * dt
+            if max_delta > 0:
+                v_left = max(self._last_v_left - max_delta, min(self._last_v_left + max_delta, v_left))
+                v_right = max(self._last_v_right - max_delta, min(self._last_v_right + max_delta, v_right))
+            self._last_v_left = v_left
+            self._last_v_right = v_right
+        elif bypass_safety:
+            # Keep state aligned so post-rotate commands don't jump unexpectedly.
+            self._last_v_left = v_left
+            self._last_v_right = v_right
+            self._last_v_time = time.time()
 
         def speed_to_pwm(v):
             ratio = max(-1.0, min(1.0, v / max_lin))
@@ -270,7 +298,7 @@ class MotorDriverNode(Node):
 
         # Use the hardware abstraction layer to actually set pins/PWM
         try:
-            self.hw.set_motor(left_duty, left_dir, right_duty, right_dir)
+            self.hw.set_motor(left_duty, left_dir, right_duty, right_dir, bypass_ramp=bypass_safety)
             self.last_output_time = now
             self._last_commanded = (left_duty, left_dir, right_duty, right_dir)
         except Exception as e:

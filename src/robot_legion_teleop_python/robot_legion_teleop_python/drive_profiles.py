@@ -192,7 +192,7 @@ def _validate_params(drive_params: Dict[str, Any], hw_params: Dict[str, Any], dr
 
     # Drive params
     positive_keys = ("wheel_base_m", "wheel_separation_m", "track_width_m", "watchdog_timeout_s", "fpv_lease_ttl_sec")
-    nonneg_keys = ("max_linear_mps", "max_angular_rps", "teleop_linear_mps", "teleop_angular_rps", "teleop_omni_turn_gain")
+    nonneg_keys = ("max_linear_mps", "max_angular_rps", "teleop_linear_mps", "teleop_angular_rps", "teleop_omni_turn_gain", "linear_accel_mps2")
     int_nonneg_keys = ("teleop_medium_steps", "teleop_fast_linear_steps", "teleop_fast_angular_steps")
 
     for k in positive_keys:
