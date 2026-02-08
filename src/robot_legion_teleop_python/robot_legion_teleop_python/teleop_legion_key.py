@@ -516,6 +516,22 @@ class RobotLegionTeleop(Node):
         except Exception:
             return {}
 
+    def _resolve_drive_type(self, robot_name: Optional[str]) -> str:
+        """Prefer heartbeat drive_type; fall back to YAML registry if missing."""
+        if not robot_name:
+            return "diff_drive"
+        hb = self._observed_profiles.get(robot_name) or {}
+        hb_drive = str(hb.get("drive_type") or "").strip().lower()
+        if hb_drive:
+            return hb_drive
+        if self._profile_registry:
+            try:
+                prof = resolve_robot_profile(self._profile_registry, robot_name)
+                return str(prof.get("drive_type") or "diff_drive").lower()
+            except Exception:
+                pass
+        return "diff_drive"
+
     def _set_speed_profile(
         self,
         linear: float,
@@ -835,8 +851,7 @@ class RobotLegionTeleop(Node):
                     mode, lin_mult, ang_mult = self.move_bindings[key]
 
                     # Strafe mode (mecanum only) overrides normal mapping
-                    profile = self._observed_profiles.get(self.current_robot_name) or {}
-                    drive_type = (profile.get("drive_type") or "diff_drive").lower()
+                    drive_type = self._resolve_drive_type(self.current_robot_name)
                     if self.strafe_mode and drive_type in ("mecanum", "omni", "omnidirectional"):
                         S = self.linear_speed
                         d = 0.7071  # diagonal normalization
@@ -928,8 +943,7 @@ class RobotLegionTeleop(Node):
 
                 # Toggle strafe mode (mecanum only)
                 if key == "0":
-                    profile = self._observed_profiles.get(self.current_robot_name) or {}
-                    drive_type = (profile.get("drive_type") or "diff_drive").lower()
+                    drive_type = self._resolve_drive_type(self.current_robot_name)
                     if drive_type in ("mecanum", "omni", "omnidirectional"):
                         self.strafe_mode = not self.strafe_mode
                         self._tprint(f"[STRAFE MODE] {'ON' if self.strafe_mode else 'OFF'}")
