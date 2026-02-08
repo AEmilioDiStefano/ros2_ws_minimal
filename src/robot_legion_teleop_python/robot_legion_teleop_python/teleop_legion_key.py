@@ -178,6 +178,8 @@ class RobotLegionTeleop(Node):
         # Smoothing for Twist commands (0=off, 1=very smooth)
         self.teleop_smoothing_alpha = float(self.get_parameter("teleop_smoothing_alpha").value)
         self._filtered_twist = Twist()
+        # Strafe mode (mecanum only) toggled by '0'
+        self.strafe_mode = False
         self._set_speed_profile(
             linear=float(self.get_parameter("teleop_linear_mps").value),
             angular=float(self.get_parameter("teleop_angular_rps").value),
@@ -385,6 +387,7 @@ class RobotLegionTeleop(Node):
         if self.current_robot_name:
             lines.append("")
             lines.append(f"ACTIVE ROBOT: {self.current_robot_name}")
+            lines.append(f"STRAFE MODE (mecanum only): {'ON' if self.strafe_mode else 'OFF'}  [toggle: 0]")
         lines.append("")
         lines.append("MOVEMENT:")
         lines.append("  8 forward")
@@ -416,6 +419,7 @@ class RobotLegionTeleop(Node):
         lines.append("")
         lines.append("Robot selection:")
         lines.append("  m choose robot")
+        lines.append("  0 toggle strafe mode (mecanum only)")
         lines.append("")
         lines.append("CTRL-C to quit.")
         lines.append("-------------------------------")
@@ -830,13 +834,44 @@ class RobotLegionTeleop(Node):
                 if key in self.move_bindings:
                     mode, lin_mult, ang_mult = self.move_bindings[key]
 
+                    # Strafe mode (mecanum only) overrides normal mapping
+                    profile = self._observed_profiles.get(self.current_robot_name) or {}
+                    drive_type = (profile.get("drive_type") or "diff_drive").lower()
+                    if self.strafe_mode and drive_type in ("mecanum", "omni", "omnidirectional"):
+                        S = self.linear_speed
+                        d = 0.7071  # diagonal normalization
+                        twist = Twist()
+                        if key in ("8", "\x1b[A"):
+                            twist.linear.x = +S
+                        elif key in ("2", "\x1b[B"):
+                            twist.linear.x = -S
+                        elif key in ("4", "\x1b[D"):
+                            twist.linear.y = +S
+                        elif key in ("6", "\x1b[C"):
+                            twist.linear.y = -S
+                        elif key == "7":
+                            twist.linear.x = +S * d
+                            twist.linear.y = +S * d
+                        elif key == "9":
+                            twist.linear.x = +S * d
+                            twist.linear.y = -S * d
+                        elif key == "1":
+                            twist.linear.x = -S * d
+                            twist.linear.y = +S * d
+                        elif key == "3":
+                            twist.linear.x = -S * d
+                            twist.linear.y = -S * d
+
+                        self.last_twist = twist
+                        self.is_moving = True
+                        self._publish_and_log_twist(twist, "strafe-mode")
+                        continue
+
                     if mode == "circle":
                         # Circle/one-track semantics differ by drive type. For diff_drive
                         # we synthesize a one-track circle via left/right track speeds.
                         # For omni/mecanum, convert to a safer lateral+rotational motion.
                         S = self.linear_speed
-                        profile = self._observed_profiles.get(self.current_robot_name) or {}
-                        drive_type = (profile.get("drive_type") or "diff_drive").lower()
 
                         if drive_type in ("diff_drive", "diff", "diff-drive"):
                             if key == "7":
@@ -889,6 +924,18 @@ class RobotLegionTeleop(Node):
                     self.last_ang_mult = 0.0
                     self.last_twist = Twist()
                     self._tprint("[STOP]")
+                    continue
+
+                # Toggle strafe mode (mecanum only)
+                if key == "0":
+                    profile = self._observed_profiles.get(self.current_robot_name) or {}
+                    drive_type = (profile.get("drive_type") or "diff_drive").lower()
+                    if drive_type in ("mecanum", "omni", "omnidirectional"):
+                        self.strafe_mode = not self.strafe_mode
+                        self._tprint(f"[STRAFE MODE] {'ON' if self.strafe_mode else 'OFF'}")
+                        self._tprint(self.render_instructions(self.cmd_vel_topic))
+                    else:
+                        self._tprint("[STRAFE MODE] Not available for diff drive.")
                     continue
 
                 # Switch robot
