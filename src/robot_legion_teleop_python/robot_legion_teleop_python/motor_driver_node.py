@@ -65,7 +65,6 @@ class MotorDriverNode(Node):
         spin_mult_default = drive_params.get("spin_speed_mult") or 0.7
         stall_timeout_default = drive_params.get("stall_timeout_s") or 0.0
         stall_duty_default = drive_params.get("stall_duty_pct") or 0.0
-        linear_accel_default = drive_params.get("linear_accel_mps2") or 0.0
 
         self.declare_parameter("wheel_separation", float(wheel_sep_default))   # meters
         self.declare_parameter("wheel_base", float(wheel_base_default))       # meters (mecanum)
@@ -82,7 +81,6 @@ class MotorDriverNode(Node):
         self.declare_parameter("spin_speed_mult", float(spin_mult_default))
         self.declare_parameter("stall_timeout_s", float(stall_timeout_default))
         self.declare_parameter("stall_duty_pct", float(stall_duty_default))
-        self.declare_parameter("linear_accel_mps2", float(linear_accel_default))
 
         # Topic this robot listens to
         self.declare_parameter("cmd_vel_topic", f"/{self.robot_name}/cmd_vel")
@@ -114,11 +112,6 @@ class MotorDriverNode(Node):
         self._stall_active = False
         self._stall_timeout_s = float(self.get_parameter("stall_timeout_s").value)
         self._stall_duty_pct = float(self.get_parameter("stall_duty_pct").value)
-        # Linear acceleration limiting (soft ramp without abrupt jumps)
-        self._linear_accel_mps2 = float(self.get_parameter("linear_accel_mps2").value)
-        self._last_v_left = 0.0
-        self._last_v_right = 0.0
-        self._last_v_time = time.time()
         self.cmd_rate_hz = float(self.get_parameter("cmd_rate_hz").value)
         self.min_cmd_period = (1.0 / self.cmd_rate_hz) if self.cmd_rate_hz > 0 else 0.0
         self.timeout_sec = float(self.get_parameter("watchdog_timeout_s").value)
@@ -235,23 +228,6 @@ class MotorDriverNode(Node):
         if bypass_safety:
             deadband = 0.0
         deadband = max(0.0, min(deadband, max_pwm))
-
-        # Optional linear acceleration limiting (soft ramp) for non-rotate commands.
-        if self._linear_accel_mps2 > 0 and not bypass_safety:
-            now = time.time()
-            dt = max(0.0, now - self._last_v_time)
-            self._last_v_time = now
-            max_delta = self._linear_accel_mps2 * dt
-            if max_delta > 0:
-                v_left = max(self._last_v_left - max_delta, min(self._last_v_left + max_delta, v_left))
-                v_right = max(self._last_v_right - max_delta, min(self._last_v_right + max_delta, v_right))
-            self._last_v_left = v_left
-            self._last_v_right = v_right
-        elif bypass_safety:
-            # Keep state aligned so post-rotate commands don't jump unexpectedly.
-            self._last_v_left = v_left
-            self._last_v_right = v_right
-            self._last_v_time = time.time()
 
         def speed_to_pwm(v):
             ratio = max(-1.0, min(1.0, v / max_lin))
