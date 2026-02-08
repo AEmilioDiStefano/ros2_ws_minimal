@@ -87,7 +87,8 @@ class MotorDriverNode(Node):
         self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value.strip() or f"/{self.robot_name}/cmd_vel"
 
         # Normalize common profile naming and initialize hardware interface.
-        gpio_map = self._normalize_gpio_map(gpio_map)
+        # For mecanum/omni we keep 4-channel names intact (fl/fr/rl/rr).
+        gpio_map = self._normalize_gpio_map(gpio_map, drive_type=self.drive_type)
         # Pass PWM frequency through the gpio_map for HardwareInterface
         gpio_map["pwm_hz"] = int(self.get_parameter("pwm_hz").value)
         gpio_map["pwm_ramp_ms"] = float(self.get_parameter("pwm_ramp_ms").value)
@@ -126,7 +127,7 @@ class MotorDriverNode(Node):
 
     # --------------------------------------------------
 
-    def _normalize_gpio_map(self, gpio_map: dict) -> dict:
+    def _normalize_gpio_map(self, gpio_map: dict, drive_type: str = "diff_drive") -> dict:
         """Normalize different hardware profile key names into a common
         mapping consumed by HardwareInterface (en_left,in1_left,in2_left,en_right,...).
 
@@ -134,6 +135,10 @@ class MotorDriverNode(Node):
         """
         if not gpio_map:
             return {}
+
+        # If mecanum/omni, keep 4-channel map intact
+        if str(drive_type).lower() in ("mecanum", "omni", "omnidirectional", "mecanum_drive"):
+            return gpio_map
 
         # If profile already uses expected keys, return as-is
         expected = ("en_left", "in1_left", "in2_left", "en_right", "in1_right", "in2_right")
