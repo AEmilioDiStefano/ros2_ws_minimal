@@ -259,7 +259,7 @@ sudo apt install -y ros-jazzy-ros-base python3-colcon-common-extensions
 
 ```
 
-Now add sourcing to your .bashrc file on the Pi:
+Enter these commands to add sourcing to your .bashrc file on the Pi:
 
 ```shell
 echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc
