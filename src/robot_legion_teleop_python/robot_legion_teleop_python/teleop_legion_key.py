@@ -178,8 +178,6 @@ class RobotLegionTeleop(Node):
         # Smoothing for Twist commands (0=off, 1=very smooth)
         self.teleop_smoothing_alpha = float(self.get_parameter("teleop_smoothing_alpha").value)
         self._filtered_twist = Twist()
-        # Strafe mode (mecanum only) toggled by '0'
-        self.strafe_mode = False
         self._set_speed_profile(
             linear=float(self.get_parameter("teleop_linear_mps").value),
             angular=float(self.get_parameter("teleop_angular_rps").value),
@@ -194,6 +192,7 @@ class RobotLegionTeleop(Node):
         self.last_ang_mult = 0.0
         self.last_twist = Twist()
         self.is_moving = False
+        self.strafe_mode = False
 
         # KEYMAP (7/9/1/3 handled specially for one-track-only circles)
         self.move_bindings = {
@@ -387,17 +386,27 @@ class RobotLegionTeleop(Node):
         if self.current_robot_name:
             lines.append("")
             lines.append(f"ACTIVE ROBOT: {self.current_robot_name}")
-            lines.append(f"STRAFE MODE (mecanum only): {'ON' if self.strafe_mode else 'OFF'}  [toggle: 0]")
+            lines.append(f"DRIVE MODE: {'STRAFE' if self.strafe_mode else 'NORMAL'}")
         lines.append("")
         lines.append("MOVEMENT:")
-        lines.append("  8 forward")
-        lines.append("  2 backward")
-        lines.append("  4 rotate-left")
-        lines.append("  6 rotate-right")
-        lines.append("  7 circle forward-left")
-        lines.append("  9 circle forward-right")
-        lines.append("  1 circle backward-left")
-        lines.append("  3 circle backward-right")
+        if self.strafe_mode:
+            lines.append("  8 forward")
+            lines.append("  2 backward")
+            lines.append("  4 strafe-left")
+            lines.append("  6 strafe-right")
+            lines.append("  7 strafe forward-left")
+            lines.append("  9 strafe forward-right")
+            lines.append("  1 strafe backward-left")
+            lines.append("  3 strafe backward-right")
+        else:
+            lines.append("  8 forward")
+            lines.append("  2 backward")
+            lines.append("  4 rotate-left")
+            lines.append("  6 rotate-right")
+            lines.append("  7 circle forward-left")
+            lines.append("  9 circle forward-right")
+            lines.append("  1 circle backward-left")
+            lines.append("  3 circle backward-right")
         lines.append("")
         lines.append("ARROW KEYS ALSO WORK")
         lines.append(" [UP] forward")
@@ -419,7 +428,7 @@ class RobotLegionTeleop(Node):
         lines.append("")
         lines.append("Robot selection:")
         lines.append("  m choose robot")
-        lines.append("  0 toggle strafe mode (mecanum only)")
+        lines.append("  0 toggle strafe mode (mecanum/omni only)")
         lines.append("")
         lines.append("CTRL-C to quit.")
         lines.append("-------------------------------")
@@ -516,22 +525,6 @@ class RobotLegionTeleop(Node):
         except Exception:
             return {}
 
-    def _resolve_drive_type(self, robot_name: Optional[str]) -> str:
-        """Prefer heartbeat drive_type; fall back to YAML registry if missing."""
-        if not robot_name:
-            return "diff_drive"
-        hb = self._observed_profiles.get(robot_name) or {}
-        hb_drive = str(hb.get("drive_type") or "").strip().lower()
-        if hb_drive:
-            return hb_drive
-        if self._profile_registry:
-            try:
-                prof = resolve_robot_profile(self._profile_registry, robot_name)
-                return str(prof.get("drive_type") or "diff_drive").lower()
-            except Exception:
-                pass
-        return "diff_drive"
-
     def _set_speed_profile(
         self,
         linear: float,
@@ -552,6 +545,51 @@ class RobotLegionTeleop(Node):
         self.medium_angular = self.base_slow_angular * (self.speed_step ** int(medium_steps))
         self.fast_linear = self.base_slow_linear * (self.speed_step ** int(fast_linear_steps))
         self.fast_angular = self.base_slow_angular * (self.speed_step ** int(fast_angular_steps))
+
+    @staticmethod
+    def _is_mecanum_drive_type(drive_type: str) -> bool:
+        dt = str(drive_type or "").strip().lower()
+        return dt in ("mecanum", "omni", "omnidirectional", "mecanum_drive", "mecanum-drive")
+
+    def _get_robot_drive_type(self, robot_name: Optional[str]) -> str:
+        if not robot_name:
+            return ""
+
+        observed = self._observed_profiles.get(robot_name) or {}
+        observed_dt = str(observed.get("drive_type") or "").strip().lower()
+        if observed_dt:
+            return observed_dt
+
+        if self._profile_registry:
+            try:
+                prof = resolve_robot_profile(self._profile_registry, robot_name)
+                return str(prof.get("drive_type") or "").strip().lower()
+            except Exception:
+                pass
+        return ""
+
+    def _current_robot_supports_strafe(self) -> bool:
+        return self._is_mecanum_drive_type(self._get_robot_drive_type(self.current_robot_name))
+
+    def _toggle_strafe_mode(self):
+        if self.publisher_ is None or not self.current_robot_name:
+            self._tprint("[STRAFE] No robot selected.")
+            return
+
+        if not self._current_robot_supports_strafe():
+            self.strafe_mode = False
+            self._tprint(f"[STRAFE] Disabled: robot '{self.current_robot_name}' is not mecanum/omni.")
+            return
+
+        self.strafe_mode = not self.strafe_mode
+
+        # Stop immediately while changing modes to avoid unexpected motion.
+        self._publish_and_log_twist(Twist(), "strafe-mode-toggle-stop")
+        self.is_moving = False
+        self.last_lin_mult = 0.0
+        self.last_ang_mult = 0.0
+        self.last_twist = Twist()
+        self._tprint(f"[STRAFE] {'ENABLED' if self.strafe_mode else 'DISABLED'}")
 
     def _apply_robot_profile(self, robot_name: str):
         """Update teleop settings based on YAML for this robot (unless ROS overrides are set)."""
@@ -616,6 +654,7 @@ class RobotLegionTeleop(Node):
         self._publish_active_robot()
         if self.current_robot_name:
             self._apply_robot_profile(self.current_robot_name)
+        self.strafe_mode = False
         self._tprint(self.render_instructions(new_topic))
         self._tprint(f"[ACTIVE ROBOT] Now controlling: {self.current_robot_name}")
 
@@ -651,7 +690,11 @@ class RobotLegionTeleop(Node):
         if not self.is_moving or self.publisher_ is None:
             return
 
-        if abs(self.last_twist.linear.x) > 1e-9 or abs(self.last_twist.angular.z) > 1e-9:
+        if (
+            abs(self.last_twist.linear.x) > 1e-9
+            or abs(self.last_twist.linear.y) > 1e-9
+            or abs(self.last_twist.angular.z) > 1e-9
+        ):
             self._publish_and_log_twist(self.last_twist, "republish")
             return
 
@@ -706,10 +749,15 @@ class RobotLegionTeleop(Node):
         # Optional smoothing to avoid harsh command spikes that stress hardware.
         # We bypass smoothing for explicit stops so the robot can halt immediately.
         if self.teleop_smoothing_alpha > 0.0:
-            is_stop = abs(twist.linear.x) < 1e-9 and abs(twist.angular.z) < 1e-9
+            is_stop = (
+                abs(twist.linear.x) < 1e-9
+                and abs(twist.linear.y) < 1e-9
+                and abs(twist.angular.z) < 1e-9
+            )
             if not is_stop:
                 a = max(0.0, min(1.0, float(self.teleop_smoothing_alpha)))
                 self._filtered_twist.linear.x = a * twist.linear.x + (1.0 - a) * self._filtered_twist.linear.x
+                self._filtered_twist.linear.y = a * twist.linear.y + (1.0 - a) * self._filtered_twist.linear.y
                 self._filtered_twist.angular.z = a * twist.angular.z + (1.0 - a) * self._filtered_twist.angular.z
                 twist = self._filtered_twist
             else:
@@ -725,6 +773,7 @@ class RobotLegionTeleop(Node):
                 command_id="twist",
                 parameters={
                     "linear_x": float(twist.linear.x),
+                    "linear_y": float(twist.linear.y),
                     "angular_z": float(twist.angular.z),
                     "description": description,
                 },
@@ -838,6 +887,8 @@ class RobotLegionTeleop(Node):
                 if self.publisher_ is None:
                     if key == "m":
                         self._prompt_until_valid_robot()
+                    elif key == "0":
+                        self._toggle_strafe_mode()
                     elif key in self.speed_bindings:
                         self.speed_bindings[key]()
                     elif key in (" ", "5", "s"):
@@ -850,36 +901,38 @@ class RobotLegionTeleop(Node):
                 if key in self.move_bindings:
                     mode, lin_mult, ang_mult = self.move_bindings[key]
 
-                    # Strafe mode (mecanum only) overrides normal mapping
-                    drive_type = self._resolve_drive_type(self.current_robot_name)
-                    if self.strafe_mode and drive_type in ("mecanum", "omni", "omnidirectional"):
+                    if self.strafe_mode and key in ("8", "2", "4", "6", "7", "9", "1", "3"):
+                        if not self._current_robot_supports_strafe():
+                            self.strafe_mode = False
+                            self._tprint(f"[STRAFE] Disabled: robot '{self.current_robot_name}' is not mecanum/omni.")
+                            continue
+
                         S = self.linear_speed
-                        d = 0.7071  # diagonal normalization
                         twist = Twist()
-                        if key in ("8", "\x1b[A"):
+                        if key == "8":
                             twist.linear.x = +S
-                        elif key in ("2", "\x1b[B"):
+                        elif key == "2":
                             twist.linear.x = -S
-                        elif key in ("4", "\x1b[D"):
+                        elif key == "4":
                             twist.linear.y = +S
-                        elif key in ("6", "\x1b[C"):
+                        elif key == "6":
                             twist.linear.y = -S
                         elif key == "7":
-                            twist.linear.x = +S * d
-                            twist.linear.y = +S * d
+                            twist.linear.x = +S
+                            twist.linear.y = +S
                         elif key == "9":
-                            twist.linear.x = +S * d
-                            twist.linear.y = -S * d
+                            twist.linear.x = +S
+                            twist.linear.y = -S
                         elif key == "1":
-                            twist.linear.x = -S * d
-                            twist.linear.y = +S * d
+                            twist.linear.x = -S
+                            twist.linear.y = +S
                         elif key == "3":
-                            twist.linear.x = -S * d
-                            twist.linear.y = -S * d
+                            twist.linear.x = -S
+                            twist.linear.y = -S
 
                         self.last_twist = twist
                         self.is_moving = True
-                        self._publish_and_log_twist(twist, "strafe-mode")
+                        self._publish_and_log_twist(twist, f"strafe-{key}")
                         continue
 
                     if mode == "circle":
@@ -887,6 +940,7 @@ class RobotLegionTeleop(Node):
                         # we synthesize a one-track circle via left/right track speeds.
                         # For omni/mecanum, convert to a safer lateral+rotational motion.
                         S = self.linear_speed
+                        drive_type = self._get_robot_drive_type(self.current_robot_name) or "diff_drive"
 
                         if drive_type in ("diff_drive", "diff", "diff-drive"):
                             if key == "7":
@@ -941,20 +995,14 @@ class RobotLegionTeleop(Node):
                     self._tprint("[STOP]")
                     continue
 
-                # Toggle strafe mode (mecanum only)
-                if key == "0":
-                    drive_type = self._resolve_drive_type(self.current_robot_name)
-                    if drive_type in ("mecanum", "omni", "omnidirectional"):
-                        self.strafe_mode = not self.strafe_mode
-                        self._tprint(f"[STRAFE MODE] {'ON' if self.strafe_mode else 'OFF'}")
-                        self._tprint(self.render_instructions(self.cmd_vel_topic))
-                    else:
-                        self._tprint("[STRAFE MODE] Not available for diff drive.")
-                    continue
-
                 # Switch robot
                 if key == "m":
                     self._prompt_until_valid_robot()
+                    continue
+
+                # Strafe mode toggle
+                if key == "0":
+                    self._toggle_strafe_mode()
                     continue
 
                 # Speed controls
