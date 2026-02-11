@@ -91,8 +91,6 @@ Pi GND to GND on both boards
 
 ### Motor power  
 
-**If you’re using your 2×18650 (2S) pack**:  
-
 Battery + to VM on both boards  
 
 Battery – to GND on both boards  
@@ -103,14 +101,9 @@ Battery – to GND on both boards
 
 **All grounds must connect together**:  
 
-Pi GND to TB6612 GND to Battery – (negative)  
+Pi GND to TB6612 GND (both drivers) 
 
-<br>  
-
-### STBY (enable)  
-
-On TB6612 #1: STBY to VCC (same board)  
-On TB6612 #2: STBY to VCC (same board)  
+TB6612 GND to Battery Negative (both drivers)  
 
 <br>  
 <br>  
