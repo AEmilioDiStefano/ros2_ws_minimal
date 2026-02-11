@@ -106,6 +106,8 @@ class RobotLegionTeleop(Node):
         # Optional parameters
         self.declare_parameter("allow_cmd_vel_switching", True)
         self.allow_cmd_vel_switching = bool(self.get_parameter("allow_cmd_vel_switching").value)
+        self.declare_parameter("teleop_debug", True)
+        self.teleop_debug = bool(self.get_parameter("teleop_debug").value)
 
         # Observed robot profiles discovered via heartbeat topics.
         # Mapping: robot_name -> {"drive_type": str, "hardware": str, "t": timestamp}
@@ -273,6 +275,10 @@ class RobotLegionTeleop(Node):
             set_raw_mode()
         except Exception:
             pass
+
+    def _dprint(self, text: str):
+        if self.teleop_debug:
+            self._tprint(f"[DEBUG] {text}")
 
     # ---------------- ROS graph warm-up (startup discovery fix) ----------------
 
@@ -571,14 +577,64 @@ class RobotLegionTeleop(Node):
     def _current_robot_supports_strafe(self) -> bool:
         return self._is_mecanum_drive_type(self._get_robot_drive_type(self.current_robot_name))
 
+    def _strafe_diagnostics(self, robot_name: Optional[str]) -> Dict[str, str]:
+        if not robot_name:
+            return {
+                "robot": "",
+                "observed_drive_type": "",
+                "registry_drive_type": "",
+                "effective_drive_type": "",
+                "supports_strafe": "False",
+                "source": "none",
+            }
+
+        observed = self._observed_profiles.get(robot_name) or {}
+        observed_dt = str(observed.get("drive_type") or "").strip().lower()
+        registry_dt = ""
+        if self._profile_registry:
+            try:
+                prof = resolve_robot_profile(self._profile_registry, robot_name)
+                registry_dt = str(prof.get("drive_type") or "").strip().lower()
+            except Exception:
+                registry_dt = ""
+
+        effective_dt = observed_dt or registry_dt
+        source = "heartbeat" if observed_dt else ("registry" if registry_dt else "unknown")
+        supports = self._is_mecanum_drive_type(effective_dt)
+        return {
+            "robot": robot_name,
+            "observed_drive_type": observed_dt,
+            "registry_drive_type": registry_dt,
+            "effective_drive_type": effective_dt,
+            "supports_strafe": str(bool(supports)),
+            "source": source,
+        }
+
     def _toggle_strafe_mode(self):
         if self.publisher_ is None or not self.current_robot_name:
             self._tprint("[STRAFE] No robot selected.")
             return
 
-        if not self._current_robot_supports_strafe():
+        diag = self._strafe_diagnostics(self.current_robot_name)
+        self._dprint(
+            "strafe-toggle request "
+            f"robot={diag['robot']} "
+            f"observed_drive_type={diag['observed_drive_type'] or '<none>'} "
+            f"registry_drive_type={diag['registry_drive_type'] or '<none>'} "
+            f"effective_drive_type={diag['effective_drive_type'] or '<none>'} "
+            f"source={diag['source']} "
+            f"supports_strafe={diag['supports_strafe']}"
+        )
+
+        if diag["supports_strafe"] != "True":
             self.strafe_mode = False
-            self._tprint(f"[STRAFE] Disabled: robot '{self.current_robot_name}' is not mecanum/omni.")
+            self._tprint(
+                f"[STRAFE] Disabled: robot '{self.current_robot_name}' is not mecanum/omni "
+                f"(effective drive_type='{diag['effective_drive_type'] or 'unknown'}')."
+            )
+            self._tprint(
+                "[STRAFE] Check robot_profiles.yaml drive_profile.type and/or heartbeat_node drive_type."
+            )
             return
 
         self.strafe_mode = not self.strafe_mode
@@ -655,6 +711,16 @@ class RobotLegionTeleop(Node):
         if self.current_robot_name:
             self._apply_robot_profile(self.current_robot_name)
         self.strafe_mode = False
+        diag = self._strafe_diagnostics(self.current_robot_name)
+        self._dprint(
+            "active-robot profile "
+            f"robot={diag['robot']} "
+            f"observed_drive_type={diag['observed_drive_type'] or '<none>'} "
+            f"registry_drive_type={diag['registry_drive_type'] or '<none>'} "
+            f"effective_drive_type={diag['effective_drive_type'] or '<none>'} "
+            f"source={diag['source']} "
+            f"supports_strafe={diag['supports_strafe']}"
+        )
         self._tprint(self.render_instructions(new_topic))
         self._tprint(f"[ACTIVE ROBOT] Now controlling: {self.current_robot_name}")
 
@@ -888,6 +954,7 @@ class RobotLegionTeleop(Node):
                     if key == "m":
                         self._prompt_until_valid_robot()
                     elif key == "0":
+                        self._dprint("key='0' received with no active robot")
                         self._toggle_strafe_mode()
                     elif key in self.speed_bindings:
                         self.speed_bindings[key]()
@@ -1002,6 +1069,7 @@ class RobotLegionTeleop(Node):
 
                 # Strafe mode toggle
                 if key == "0":
+                    self._dprint("key='0' received with active robot")
                     self._toggle_strafe_mode()
                     continue
 
