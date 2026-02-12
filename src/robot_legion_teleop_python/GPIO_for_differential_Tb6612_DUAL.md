@@ -14,7 +14,8 @@
 
 ### For wiring from the motor drivers to the Pi, common Dupont jumper cables are ok.
 
-<br>  
+#  
+# 
 
 ## POWER YOUR MOTOR CIRCUIT (USE 18 AVG!)
 
