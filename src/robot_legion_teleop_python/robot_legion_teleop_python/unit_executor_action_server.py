@@ -272,6 +272,20 @@ class UnitExecutor(Node):
         except Exception:
             pass
 
+    def _set_result_safe(self, result_msg, success: bool, text: str):
+        """
+        Populate whichever result fields exist in the installed action definition.
+        """
+        if hasattr(result_msg, "accepted"):
+            # If execute callback ran, the goal was accepted by definition.
+            result_msg.accepted = True
+        if hasattr(result_msg, "success"):
+            result_msg.success = bool(success)
+        if hasattr(result_msg, "reason"):
+            result_msg.reason = str(text)
+        if hasattr(result_msg, "result_text"):
+            result_msg.result_text = str(text)
+
     # ---------------- executor ----------------
     def execute_cb(self, goal_handle):
         """
@@ -297,8 +311,7 @@ class UnitExecutor(Node):
             )
             goal_handle.abort()
             result = ExecutePlaybook.Result()
-            result.success = False
-            result.result_text = err
+            self._set_result_safe(result, success=False, text=err)
             return result
 
         def fb(percent: float, text: str):
@@ -421,8 +434,11 @@ class UnitExecutor(Node):
         # Mark success
         goal_handle.succeed()
         result = ExecutePlaybook.Result()
-        result.success = True
-        result.result_text = f"ok ({selected_strategy})" if selected_strategy else "ok"
+        self._set_result_safe(
+            result,
+            success=True,
+            text=f"ok ({selected_strategy})" if selected_strategy else "ok",
+        )
         
         # Log successful goal execution
         goal_duration_s = time.time() - goal_start_time

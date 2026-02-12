@@ -118,6 +118,19 @@ def _make_nodes(context, *args, **kwargs):
         ],
     )
 
+    # Playbook action executor under /<robot_name>/execute_playbook
+    _try_node(
+        package="robot_legion_teleop_python",
+        executable="unit_executor_action_server",
+        name="unit_executor_action_server",
+        namespace=robot_name,
+        output="screen",
+        parameters=[
+            {"robot_name": robot_name},
+            {"profiles_path": profiles_path},
+        ],
+    )
+
     # Camera publisher under /<robot_name>/image_raw (USB webcam)
     if use_camera:
         _try_node(
