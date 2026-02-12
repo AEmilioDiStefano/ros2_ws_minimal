@@ -2,7 +2,7 @@
 
 ## Overview
 
-`robot_legion_teleop_python` is a ROS 2 package providing GFE (Government-Furnished Equipment) reference implementation of heterogeneous robot control for the DIU Fleet Orchestrator. It enables:
+`robot_legion_teleop_python` enables:
 
 - **Multi-robot command execution** via playbook-based primitives (transit, rotate, strafe, hold, diagonal, turn)
 - **Hardware abstraction** supporting differential-drive and omnidirectional (mecanum) robots
@@ -18,13 +18,14 @@
 #### `playbook_contract.py`
 Defines the command interface between the intent translator and robot execution.
 
-**Canonical Primitives** (6 allowed commands):
+**Canonical Primitives** (7 allowed commands):
 - `hold`: Stop all motion
 - `transit`: Move forward/backward
 - `rotate`: Rotate left/right (diff) or rotate in place (mecanum)
 - `strafe`: Side-to-side motion (mecanum only; safe no-op on diff)
 - `diagonal`: Diagonal movement (mecanum only; safe no-op on diff)
 - `turn`: Curved arc motion (diff) or in-place rotation (mecanum)
+- `transit_xy`: Platform-agnostic cardinal displacement target (`north_m`, `east_m`) with strategy chosen from drive/hardware profile
 
 **Parameter Structure**:
 ```json
@@ -36,10 +37,21 @@ Defines the command interface between the intent translator and robot execution.
   "parameters": {
     "speed": 0.5,
     "direction": "fwd|bwd|left|right|...",
-    "duration_s": 5.0
+    "duration_s": 5.0,
+    "north_m": 5.0,
+    "east_m": -2.0
   }
 }
 ```
+
+For `transit_xy`, `parameters_json` also accepts centimeter keys (`north_cm`, `south_cm`, `east_cm`, `west_cm`, `left_cm`, `x_cm`, `y_cm`) and normalizes them to meters.
+
+Cardinal behavior note:
+- The API stays in `north/east` language for fleet-wide consistency.
+- Robots without magnetometer/compass currently interpret:
+  - `north` as robot-forward
+  - `east` as robot-right
+- Robots with heading sensors can enable true cardinal conversion robot-side (no fleet_orchestrator schema change required).
 
 #### `hardware_interface.py`
 GPIO/PWM abstraction for motor control with mock fallback.
@@ -229,6 +241,8 @@ Parameters:
 - `drive_type`: `diff_drive` (2-motor) or `mecanum` (4-motor)
 - `hardware`: `L298N_diff` (H-bridge relay) or `dual_tb6612_mecanum` (TB6612FNG dual driver), etc.
 - `profiles_path`: Optional custom YAML file path
+- `has_magnetometer`: `false` by default; when `true`, executor enables north/east heading conversion path
+- `heading_rad`: optional current heading (radians, 0 means facing north) used when `has_magnetometer:=true`
 - `use_camera`: `true` (default) or `false` to disable USB camera
 
 #### Graceful Degradation for Missing Packages
@@ -309,6 +323,21 @@ ros2 action send_goal /robot1/playbook_goal robot_legion_teleop_python/action/Ex
   '{command_id: "cmd_1", intent_id: "intent_1", robot: "robot1", command: "transit", 
     parameters_json: "{\"speed\": 0.5, \"direction\": \"fwd\", \"duration_s\": 5.0}"}'
 ```
+
+### 7. Test Heterogeneous `transit_xy` Strategy Selection
+
+Send the same displacement goal to different robots and observe different robot-side execution plans:
+
+```bash
+# Example target: 500 cm forward, 200 cm left
+ros2 action send_goal /robot1/execute_playbook fleet_orchestrator_interfaces/action/ExecutePlaybook \
+  "{intent_id: 'intent_xy_1', command_id: 'transit_xy', north_m: 5.0, east_m: -2.0, parameters_json: '{\"north_cm\":500,\"left_cm\":200,\"speed\":1.0}'}"
+```
+
+Expected strategy by profile:
+- `mecanum/omni` drive: direct strafe-capable XY motion
+- `diff + dual_tb6612_diff`: heading-then-transit (direct line to target)
+- `diff + L298N_diff`: axis-split path (east/west leg then north/south leg)
 
 ### 6. Monitor Audit Logs
 

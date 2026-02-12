@@ -81,7 +81,7 @@ drive_profiles:
       stall_timeout_s: 0
       stall_duty_pct: 0
 
-      # Teleop defaults (keyboard)
+      # Teleop defaults (keyboard)  
       teleop_linear_mps: 0.5
       teleop_angular_rps: 1.0
       teleop_speed_step: 1.1
@@ -97,7 +97,7 @@ drive_profiles:
   mecanum_drive:
     type: omni
     params:
-      # These are placeholders for future "proper kinematics" if you want it.
+      # These are placeholders for configuring proper kinematics  
       wheel_base_m: 0.18
       track_width_m: 0.18
       max_linear_mps: 0.4

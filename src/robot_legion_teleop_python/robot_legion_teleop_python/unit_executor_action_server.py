@@ -46,6 +46,7 @@ from fleet_orchestrator_interfaces.action import ExecutePlaybook
 from .drive_profiles import load_profile_registry, resolve_robot_profile
 from .playbook_helpers import TimedTwistPlan, run_timed_twist
 from .playbook_contract import validate_and_normalize
+from .playbook_strategies import compile_transit_xy_plans
 from .audit_logger import AuditLogger
 
 
@@ -62,6 +63,9 @@ class UnitExecutor(Node):
         self.declare_parameter("default_strafe_speed_mps", 0.35)
         self.declare_parameter("default_rotate_speed_rps", 2.00)
         self.declare_parameter("default_turn_linear_mps", 0.18)
+        self.declare_parameter("has_magnetometer", False)
+        self.declare_parameter("heading_rad", 0.0)
+        self.declare_parameter("heading_topic", "")
 
         self.robot = str(self.get_parameter("robot_name").value).strip() or getpass.getuser()
 
@@ -69,6 +73,8 @@ class UnitExecutor(Node):
         profiles_path = str(self.get_parameter("profiles_path").value).strip() or None
 
         prof = None
+        self.drive_params = {}
+        self.hardware_params = {}
         try:
             reg = load_profile_registry(profiles_path)
             prof = resolve_robot_profile(reg, self.robot)
@@ -84,6 +90,40 @@ class UnitExecutor(Node):
         else:
             self.hardware = prof.get("hardware")
             self.profile_name = prof.get("profile_name")
+            self.drive_params = prof.get("drive_params", {}) or {}
+            self.hardware_params = prof.get("hardware_params", {}) or {}
+
+        profile_has_mag = bool(self.hardware_params.get("has_magnetometer", False))
+        param_has_mag = bool(self.get_parameter("has_magnetometer").value)
+        self.has_magnetometer = bool(profile_has_mag or param_has_mag)
+        self.cardinal_mode = "global_cardinal" if self.has_magnetometer else "relative_fallback"
+        self.heading_topic = str(self.get_parameter("heading_topic").value).strip() or f"/{self.robot}/heading_rad"
+        self._latest_heading_rad = float(self.get_parameter("heading_rad").value)
+
+        # FUTURE: live heading ingestion from IMU/magnetometer topic
+        # -----------------------------------------------------------------
+        # Keep this disabled until a heading publisher exists on the robot.
+        # This lets fleet_orchestrator keep a stable north/east contract while
+        # sensor-equipped robots upgrade to true cardinal behavior robot-side.
+        #
+        # Example expected topic:
+        #   /<robot>/heading_rad   (std_msgs/msg/Float32)
+        #
+        # To enable later:
+        # 1) Uncomment import near top:
+        #      from std_msgs.msg import Float32
+        # 2) Uncomment the subscription below.
+        # 3) Ensure your magnetometer/IMU node publishes heading_rad where:
+        #      0.0 rad means robot facing north
+        #      +pi/2 rad means robot facing east
+        #
+        # if self.has_magnetometer:
+        #     self._heading_sub = self.create_subscription(
+        #         Float32,
+        #         self.heading_topic,
+        #         self._on_heading_rad,
+        #         10,
+        #     )
 
         # Load baseline speeds
         self.v = float(self.get_parameter("default_transit_speed_mps").value)
@@ -113,8 +153,32 @@ class UnitExecutor(Node):
 
         self.get_logger().info(f"[{self.robot}] UnitExecutor ready")
         self.get_logger().info(f"[{self.robot}] action={self.action_name}")
-        self.get_logger().info(f"[{self.robot}] drive_type={self.drive_type} cmd_vel={self.cmd_vel_topic}")
+        self.get_logger().info(
+            f"[{self.robot}] drive_type={self.drive_type} hardware={self.hardware} "
+            f"profile={self.profile_name} cmd_vel={self.cmd_vel_topic}"
+        )
+        self.get_logger().info(
+            f"[{self.robot}] cardinal_mode={self.cardinal_mode} "
+            f"(north/east API {'uses heading conversion' if self.has_magnetometer else 'maps to forward/right fallback'})"
+        )
+        self.get_logger().info(
+            f"[{self.robot}] heading source="
+            f"{self.heading_topic} (live subscription disabled; using heading_rad param/cache)"
+        )
         self.get_logger().info(f"[{self.robot}] Audit log: {audit_log_path}")
+
+    # FUTURE: live heading callback from magnetometer/IMU topic.
+    # def _on_heading_rad(self, msg):
+    #     """
+    #     Expected msg type: std_msgs/msg/Float32
+    #     Value convention:
+    #       0.0 -> facing north
+    #       +pi/2 -> facing east
+    #     """
+    #     try:
+    #         self._latest_heading_rad = float(msg.data)
+    #     except Exception:
+    #         pass
 
     # ---------------- action callbacks ----------------
     def goal_cb(self, goal_request):
@@ -158,6 +222,30 @@ class UnitExecutor(Node):
     # ---------------- helpers ----------------
     def _publish(self, twist: Twist):
         self.cmd_pub.publish(twist)
+
+    def _run_plan_sequence(self, plans, fb, stop_event):
+        """
+        Run a sequence of TimedTwistPlan objects while reporting global progress.
+        """
+        if not plans:
+            return
+        total = float(len(plans))
+        for idx, plan in enumerate(plans):
+            if stop_event is not None and stop_event.is_set():
+                break
+
+            def _phase_fb(percent, text, phase_idx=idx):
+                global_percent = ((phase_idx + (float(percent) / 100.0)) / total) * 100.0
+                fb(global_percent, text)
+
+            run_timed_twist(
+                self._publish,
+                _phase_fb,
+                plan,
+                rate_hz=20.0,
+                stop_at_end=True,
+                stop_event=stop_event,
+            )
 
     def _publish_feedback_safe(self, goal_handle, feedback_msg, percent: float, text: str):
         """
@@ -239,6 +327,7 @@ class UnitExecutor(Node):
         cid = parsed.command_id
         direction = parsed.direction
         duration_s = parsed.duration_s
+        selected_strategy = ""
 
         # Implement primitives.
         if cid == "hold":
@@ -292,29 +381,63 @@ class UnitExecutor(Node):
                 twist.angular.z = w if direction in ("left", "ccw") else -w
                 status = f"rotate {direction}"
             plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=status)
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True)
+            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
+
+        elif cid == "transit_xy":
+            # Prefer normalized JSON values, but allow typed action fields as fallback.
+            north_m = float(parsed.north_m)
+            east_m = float(parsed.east_m)
+            if abs(north_m) < 1e-9 and hasattr(goal, "north_m"):
+                north_m = float(getattr(goal, "north_m"))
+            if abs(east_m) < 1e-9 and hasattr(goal, "east_m"):
+                east_m = float(getattr(goal, "east_m"))
+
+            # Current heading source:
+            # - no magnetometer: ignored (relative_fallback mode)
+            # - has magnetometer: use cached value (seeded from heading_rad param)
+            # Future: when heading subscription is enabled, callback updates cache.
+            heading_rad = None
+            if self.has_magnetometer:
+                heading_rad = float(self._latest_heading_rad)
+
+            compiled = compile_transit_xy_plans(
+                drive_type=self.drive_type,
+                hardware=self.hardware,
+                north_m=north_m,
+                east_m=east_m,
+                v_fwd=v,
+                v_strafe=vy,
+                w_rot=w,
+                cardinal_mode=self.cardinal_mode,
+                heading_rad=heading_rad,
+            )
+            selected_strategy = compiled.strategy_id
+            self.get_logger().info(
+                f"[{self.robot}] transit_xy north={north_m:.3f}m east={east_m:.3f}m "
+                f"cardinal_mode={self.cardinal_mode} strategy={selected_strategy} steps={len(compiled.plans)}"
+            )
+            self._run_plan_sequence(compiled.plans, fb, stop_event)
 
         # Mark success
         goal_handle.succeed()
         result = ExecutePlaybook.Result()
         result.success = True
-        result.result_text = "ok"
+        result.result_text = f"ok ({selected_strategy})" if selected_strategy else "ok"
         
         # Log successful goal execution
         goal_duration_s = time.time() - goal_start_time
         self.audit.log_command(
             robot=self.robot,
             source="orchestrator",
-            command_id=goal_request.command_id,
-            parameters=json.loads(goal_request.parameters_json or "{}"),
+            command_id=goal.command_id,
+            parameters=parsed.raw_params,
             status="succeeded",
             source_id=intent_id,
             duration_s=goal_duration_s,
         )
         
         # Clean up the active goal tracking
-        if intent_id in self._active_goals:
-            del self._active_goals[intent_id]
+        self._active_goals.pop(id(goal_handle), None)
         
         return result
 

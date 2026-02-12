@@ -59,6 +59,10 @@ ALLOWED_COMMAND_IDS: Set[str] = {
     # - on diff: forward + yaw (a curved path)
     # - on mecanum: treat as rotate (keeps it safe + predictable)
     "turn",
+
+    # displacement primitive used by orchestrators for platform-agnostic goals.
+    # execution strategy is selected robot-side from drive/hardware profile.
+    "transit_xy",
 }
 
 
@@ -90,7 +94,84 @@ class ParsedPlaybook:
     duration_s: float
     speed_scale: float
     direction: str
+    north_m: float
+    east_m: float
     raw_params: Dict[str, Any]
+
+
+def _as_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _extract_xy_meters(params: Dict[str, Any]) -> Tuple[float, float]:
+    """
+    Extract displacement with meter-first keys and cm fallback keys.
+
+    Canonical API is cardinal:
+      - north_m / east_m (or cm variants)
+
+    Current hardware reality:
+      - most robots do not have a magnetometer/compass
+      - robot_legion_teleop_python therefore keeps cardinal terms in the API,
+        but executor currently interprets them as body-relative fallback:
+        north -> forward, east -> right
+      - this keeps fleet_orchestrator command schema stable across mixed fleets
+        and allows true cardinal behavior to be enabled robot-side later.
+
+    Accepted keys (meters):
+      - north_m / south_m / forward_m / y_m
+      - east_m / west_m / right_m / x_m
+
+    Accepted keys (centimeters, converted to meters):
+      - north_cm / south_cm / forward_cm / y_cm
+      - east_cm / west_cm / right_cm / x_cm
+      - left_cm (treated as negative east/right)
+    """
+    north_m = 0.0
+    east_m = 0.0
+
+    # meter variants
+    if any(k in params for k in ("north_m", "forward_m", "y_m")):
+        north_m = _as_float(
+            params.get("north_m", params.get("forward_m", params.get("y_m", 0.0))),
+            0.0,
+        )
+    elif "south_m" in params:
+        north_m = -_as_float(params.get("south_m"), 0.0)
+    if any(k in params for k in ("east_m", "right_m", "x_m")):
+        east_m = _as_float(
+            params.get("east_m", params.get("right_m", params.get("x_m", 0.0))),
+            0.0,
+        )
+    elif "west_m" in params:
+        east_m = -_as_float(params.get("west_m"), 0.0)
+
+    # centimeter variants (only used when meter value absent)
+    if abs(north_m) < 1e-9 and any(k in params for k in ("north_cm", "forward_cm", "y_cm")):
+        north_cm = _as_float(
+            params.get("north_cm", params.get("forward_cm", params.get("y_cm", 0.0))),
+            0.0,
+        )
+        north_m = north_cm / 100.0
+    elif abs(north_m) < 1e-9 and "south_cm" in params:
+        north_m = -_as_float(params.get("south_cm"), 0.0) / 100.0
+
+    if abs(east_m) < 1e-9:
+        if any(k in params for k in ("east_cm", "right_cm", "x_cm")):
+            east_cm = _as_float(
+                params.get("east_cm", params.get("right_cm", params.get("x_cm", 0.0))),
+                0.0,
+            )
+            east_m = east_cm / 100.0
+        elif "west_cm" in params:
+            east_m = -_as_float(params.get("west_cm"), 0.0) / 100.0
+        elif "left_cm" in params:
+            east_m = -_as_float(params.get("left_cm"), 0.0) / 100.0
+
+    return north_m, east_m
 
 
 def _safe_json_dict(s: str) -> Dict[str, Any]:
@@ -169,10 +250,24 @@ def validate_and_normalize(command_id: str, parameters_json: Optional[str]) -> T
     if cid == "diagonal" and direction not in ("fwd_left", "fwd_right", "back_left", "back_right"):
         return False, f"Invalid direction '{direction}' for command '{cid}'", None
 
+    north_m = 0.0
+    east_m = 0.0
+    if cid == "transit_xy":
+        north_m, east_m = _extract_xy_meters(params)
+        # Clamp to sane demo bounds (same spirit as duration clamp).
+        north_m = max(-100.0, min(100.0, north_m))
+        east_m = max(-100.0, min(100.0, east_m))
+
+        # Keep normalized values visible to downstream executor/audit logs.
+        params["north_m"] = north_m
+        params["east_m"] = east_m
+
     return True, "", ParsedPlaybook(
         command_id=cid,
         duration_s=duration_s,
         speed_scale=speed_scale,
         direction=direction,
+        north_m=north_m,
+        east_m=east_m,
         raw_params=params,
     )
