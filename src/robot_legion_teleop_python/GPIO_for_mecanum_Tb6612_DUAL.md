@@ -30,8 +30,6 @@
 
 **THEN** connect the other side of the resistor to the positive side of a small LED  
 
-<br>  
-
 ### Now connect three more 18 AWG cables to the NEGATIVE SIDE of your battery holder(s) 
 
 **CONNECT ONE OF YOUR NEGATIVE 18 AWG CABLES** to one of the **GND**s on one of your motor drivers
