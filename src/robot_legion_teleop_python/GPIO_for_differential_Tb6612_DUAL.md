@@ -56,8 +56,13 @@ If the LED does not light up, check your circuit and your batteries.
 
 ### IMPORTANT: Make sure to leave the ON/OFF switch on OFF while you perform ANY CHANGES to your circuit or your GPIO pins, otherwise you could blow a fuse  
 
+#  
+#  
+
 <br>  
-<br>  
+
+#  
+#   
 
 ### TB6612 #1 - LEFT SIDE MOTORS (paired together)  
 
