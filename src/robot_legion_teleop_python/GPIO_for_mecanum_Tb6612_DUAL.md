@@ -4,7 +4,7 @@
 
 ### ALL WIRING from the Li-Ion batteries to the motor drivers MUST BE at least 18 AWG    
 
-## For wiring from the motor drivers to the Pi, common Dupont jumper cables are ok.
+### For wiring from the motor drivers to the Pi, common Dupont jumper cables are ok.
 
 <br>  
 
