@@ -1,10 +1,12 @@
 # GPIO connections from Raspberry Pi 4 to DUAL Tb6612 motor controllers for a MECANUM Chassis  
 
-### CAUTION: This robot uses a <u>Tb6612</u> motor driver.  
+### CAUTION:  This robot uses a <u>Tb6612</u> motor driver.  
 
 ### ALL WIRING from the Li-Ion batteries to the motor drivers MUST BE at least 18 AWG    
 
 ## For wiring from the motor drivers to the Pi, common Dupont jumper cables are ok.
+
+<br>  
 
 ### TB6612 #1 — FRONT MOTORS  
 
