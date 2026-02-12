@@ -1,0 +1,9 @@
+{
+  "type": "universal_intent",
+  "intent_id": "intent_000001",
+  "timestamp_utc": "2026-01-19T00:00:00Z",
+  "source": { "modality": "text", "operator_id": "operator", "client_id": "laptop" },
+  "text": "Move all vehicles 5 meters east and hold.",
+  "targets": { "fleet_selector": "all" },
+  "constraints": { "conserve_battery": false }
+}

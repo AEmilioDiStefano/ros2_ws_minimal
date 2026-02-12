@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!-- SPDX-License-Identifier: LicenseRef-Proprietary -->
+<package format="3">
+  <name>fleet_orchestrator_schemas</name>
+  <version>0.1.0</version>
+  <description>JSON schemas and examples for fleet_orchestrator universal messages.</description>
+
+  <maintainer email="emilio@vitruvian.systems">fleet_orchestrator</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>python3</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

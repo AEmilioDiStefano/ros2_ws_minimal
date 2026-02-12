@@ -1,0 +1,51 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: LicenseRef-Proprietary -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Fleet Orchestrator HMI (Sprint 1)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: sans-serif; margin: 24px; max-width: 900px; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; }
+      input, textarea, button { font-size: 16px; padding: 10px; }
+      textarea { width: 100%; height: 120px; }
+      .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin-top: 14px; }
+      .muted { color: #666; }
+      code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>Fleet Orchestrator HMI</h1>
+    <p class="muted">
+      Publishes intent to <code>/fo/hmi/intent_text</code> via rosbridge.
+      Start rosbridge with: <code>ros2 run rosbridge_server rosbridge_websocket</code>
+    </p>
+
+    <div class="card">
+      <div class="row">
+        <input id="ws" style="flex: 1;" value="ws://localhost:9090" />
+        <button id="connect">Connect</button>
+      </div>
+      <p id="status" class="muted">Not connected.</p>
+    </div>
+
+    <div class="card">
+      <h2>Text Intent</h2>
+      <textarea id="intent" placeholder="Example: Move all vehicles 5 meters east and hold."></textarea>
+      <div class="row">
+        <button id="send">Send Intent</button>
+        <button id="clear">Clear</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Live Output</h2>
+      <p class="muted">Subscribes to <code>/fo/task</code> and <code>/fo/audit</code> (JSON on std_msgs/String).</p>
+      <pre id="out" style="white-space: pre-wrap;"></pre>
+    </div>
+
+    <script src="roslib.min.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

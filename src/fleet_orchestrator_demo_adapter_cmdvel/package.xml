@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<!-- SPDX-License-Identifier: LicenseRef-Proprietary -->
+<package format="3">
+  <name>fleet_orchestrator_demo_adapter_cmdvel</name>
+  <version>0.1.0</version>
+  <description>Demo-only adapter: PlaybookCommand(JSON) -> /&lt;robot&gt;/cmd_vel (diff-drive lab validation).</description>
+
+  <maintainer email="emilio">fleet_orchestrator</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
