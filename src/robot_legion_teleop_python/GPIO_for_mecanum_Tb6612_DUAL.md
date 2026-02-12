@@ -8,7 +8,7 @@
 
 <br>  
 
-### POWER YOUR M OTOR DRIVERS (USE 18 AVG)
+## POWER YOUR M OTOR DRIVERS (USE 18 AVG)
 
 **This project uses battery holders for two 3.7V 2800mAh Li-Ion battteries**
 
@@ -53,7 +53,7 @@ If the LED does not light up, check your circuit and your batteries.
 <br>  
 <br>  
 
-### TB6612 #1 — FRONT MOTORS  
+## TB6612 #1 — FRONT MOTORS  
 
 **FRONT-LEFT MOTOR (Channel A)**  
 
@@ -93,7 +93,7 @@ BIN2 to GPIO 19
 <br>  
 <br>  
 
-### TB6612 #2 — REAR MOTORS  
+## TB6612 #2 — REAR MOTORS  
 
 **REAR-LEFT MOTOR (Channel A)**  
 
@@ -132,6 +132,8 @@ BIN2 to GPIO 24
 <br>  
 <br>  
 
+## COMPLETE THE CIRCUIT
+
 ### Logic power  
 
 Pi 3.3V to VCC on both TB6612 boards  
@@ -158,8 +160,6 @@ TB6612 GND to Battery **Negative** (both drivers)
 
 <br>  
 <br>  
-
-### COMPLETE THE CIRCUIT  
 
 ### To complete the circuit, connect STBY and VCC on BOTH MOTOR DRIVERS to the single 3.3V pin on the Raspberry Pi  
 
