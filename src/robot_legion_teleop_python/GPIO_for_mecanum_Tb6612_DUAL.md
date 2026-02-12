@@ -8,7 +8,7 @@
 
 <br>  
 
-## POWER YOUR M OTOR DRIVERS (USE 18 AVG)
+## POWER YOUR MOTORS AND DRIVERS (USE 18 AVG!)
 
 **This project uses battery holders for two 3.7V 2800mAh Li-Ion battteries**
 
