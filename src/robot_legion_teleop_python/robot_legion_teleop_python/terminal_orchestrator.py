@@ -349,6 +349,24 @@ class TerminalOrchestrator(Node):
             return 0.0
         return (px * ly - py * lx) / denom
 
+    def _rotate_vector_into_robot_frame(
+        self, x_main: float, y_main: float, robot_heading_from_main_rad: float
+    ) -> Tuple[float, float]:
+        """
+        Convert a vector expressed in main-robot frame into a non-main robot frame.
+
+        robot_heading_from_main_rad:
+        - 0 rad means robot faces same direction as main.
+        - Positive follows this module's clock conversion convention.
+        """
+        a = float(robot_heading_from_main_rad)
+        c = math.cos(a)
+        s = math.sin(a)
+        # v_main = R(a) * v_robot  =>  v_robot = R(-a) * v_main
+        xr = float(x_main) * c + float(y_main) * s
+        yr = -float(x_main) * s + float(y_main) * c
+        return xr, yr
+
     def _plan_two_leg_deterministic(
         self,
         dx: float,
@@ -363,33 +381,26 @@ class TerminalOrchestrator(Node):
         """
         Deterministic two-leg planner using constrained linear algebra search.
 
-        We keep a common final heading theta2_fixed for all robots, then scan theta1
-        (same turn side, smaller magnitude) and solve segment lengths from:
+        We keep a fixed final heading theta2_fixed, then scan theta1 on the
+        requested side and solve segment lengths from:
           l1*u(theta1) + l2*u(theta2) = [dx, dy]
 
         Candidate quality is based on closeness to target_max_detour_m while enforcing:
         - forward+forward legs (l1,l2 > 0),
-        - same-side rotations,
         - max detour bound.
         """
         side_sign = +1.0 if turn_side == "left" else -1.0
         min_abs = math.radians(4.0)
-        max_abs = math.radians(70.0)
-        theta2 = side_sign * min(max_abs, max(min_abs, abs(theta2_fixed)))
-        h2 = abs(theta2)
-
-        # theta1 must be smaller magnitude than theta2 for same-side second rotation.
-        h1_min = min_abs
-        h1_max = h2 - math.radians(2.0)
-        if h1_max <= h1_min:
-            return None
+        # Wider heading envelope improves feasibility for large lateral offsets.
+        max_abs = math.radians(85.0)
+        theta2 = float(theta2_fixed)
 
         best: Optional[TwoLegPlan] = None
         best_err = float("inf")
 
         for i in range(max_samples):
             ratio = i / max(1, max_samples - 1)
-            h1 = h1_min + ratio * (h1_max - h1_min)
+            h1 = min_abs + ratio * (max_abs - min_abs)
             theta1 = side_sign * h1
 
             solved = self._solve_two_leg_lengths(dx=dx, dy=dy, theta1=theta1, theta2=theta2)
@@ -398,13 +409,6 @@ class TerminalOrchestrator(Node):
             l1, l2 = solved
             # Enforce forward+forward style.
             if l1 <= 0.02 or l2 <= 0.02:
-                continue
-
-            # Same-side second rotation check.
-            dtheta2 = theta2 - theta1
-            if side_sign > 0 and dtheta2 <= 0.0:
-                continue
-            if side_sign < 0 and dtheta2 >= 0.0:
                 continue
 
             wx = l1 * math.cos(theta1)
@@ -496,7 +500,7 @@ class TerminalOrchestrator(Node):
         if main_robot not in ordered:
             for r in ordered:
                 if r != main_robot:
-                    out[r] = {"distance_m": default_spacing_m, "clock": 3.0}
+                    out[r] = {"distance_m": default_spacing_m, "clock": 3.0, "heading_clock": 12.0}
             return out
 
         main_idx = ordered.index(main_robot)
@@ -509,7 +513,7 @@ class TerminalOrchestrator(Node):
             if dist < 1e-6:
                 dist = float(default_spacing_m)
             clock = 9.0 if k < 0 else 3.0
-            out[robot] = {"distance_m": dist, "clock": clock}
+            out[robot] = {"distance_m": dist, "clock": clock, "heading_clock": 12.0}
         return out
 
     def _prompt_relative_robot_config(
@@ -519,8 +523,10 @@ class TerminalOrchestrator(Node):
         defaults: Dict[str, Dict[str, float]],
     ) -> Optional[Dict[str, Dict[str, float]]]:
         """
-        Ask user to confirm defaults or customize each non-main robot's
-        distance and clock-direction relative to the main robot.
+        Ask user to confirm defaults or customize each non-main robot's:
+        - distance from main robot,
+        - position clock-direction relative to main robot,
+        - heading clock-direction relative to main robot.
         """
         lines = [
             "Default relative config:",
@@ -534,7 +540,9 @@ class TerminalOrchestrator(Node):
                 continue
             d = defaults.get(robot, {}).get("distance_m", 0.45)
             c = defaults.get(robot, {}).get("clock", 3.0)
+            h = defaults.get(robot, {}).get("heading_clock", 12.0)
             lines.append(f"{robot}: {d:.2f}m @ {c:.1f} o'clock")
+            lines.append(f"  heading -> {h:.1f} o'clock")
         lines.extend(["", "Use defaults? [Y/n]"])
         self._print_screen("RELATIVE CONFIG", lines)
         use_defaults = input("> ").strip().lower()
@@ -550,6 +558,7 @@ class TerminalOrchestrator(Node):
                 continue
             d_default = float(defaults.get(robot, {}).get("distance_m", 0.45))
             c_default = float(defaults.get(robot, {}).get("clock", 3.0))
+            h_default = float(defaults.get(robot, {}).get("heading_clock", 12.0))
 
             self._print_screen(
                 "ROBOT DISTANCE",
@@ -580,7 +589,32 @@ class TerminalOrchestrator(Node):
                 return None
             # Keep clock in [0, 12) for stable rendering.
             clock = float(clock) % 12.0
-            custom[robot] = {"distance_m": float(dist), "clock": clock}
+
+            self._print_screen(
+                "ROBOT HEADING",
+                [
+                    f"relative to the main robot ({main_robot}),",
+                    f"{robot} is pointing toward ___ o'clock",
+                    "enter a value:",
+                    "",
+                    "12 -> same direction as main",
+                    "3 -> right of main heading",
+                    "6 -> opposite direction",
+                    "9 -> left of main heading",
+                    "Type 'back' to cancel.",
+                ],
+            )
+            heading_clock = self._prompt_float(
+                f"{robot} heading o'clock", default=h_default, allow_zero=False
+            )
+            if heading_clock is None:
+                return None
+            heading_clock = float(heading_clock) % 12.0
+            custom[robot] = {
+                "distance_m": float(dist),
+                "clock": clock,
+                "heading_clock": heading_clock,
+            }
 
         return custom
 
@@ -938,7 +972,8 @@ class TerminalOrchestrator(Node):
         x_m = self._prompt_float("x meters", default=1.0)
         if x_m is None:
             return
-        y_m = self._prompt_float("y meters", default=0.0)
+        # Default y to 1.0 so the default objective is genuinely 2D by default.
+        y_m = self._prompt_float("y meters", default=1.0)
         if y_m is None:
             return
         speed = self._prompt_float("speed scale", default=self.default_speed_scale, allow_zero=False)
@@ -996,18 +1031,29 @@ class TerminalOrchestrator(Node):
 
         # Build per-robot target vectors from base objective + relative offsets.
         goal_vectors: Dict[str, Tuple[float, float]] = {main_robot: (float(x_m), float(y_m))}
+        robot_heading_offset_rad: Dict[str, float] = {main_robot: 0.0}
         for robot in detected_robots:
             if robot == main_robot:
                 continue
-            cfg = rel_cfg.get(robot, {"distance_m": 0.45, "clock": 3.0})
+            cfg = rel_cfg.get(robot, {"distance_m": 0.45, "clock": 3.0, "heading_clock": 12.0})
             dist = float(cfg.get("distance_m", 0.45))
             clock = float(cfg.get("clock", 3.0))
+            heading_clock = float(cfg.get("heading_clock", 12.0))
             rad = self._clock_to_rad(clock)
+            heading_rad = self._clock_to_rad(heading_clock)
+            robot_heading_offset_rad[robot] = heading_rad
             # Relative offset in robot frame:
             # +x forward, +y right.
             ox = dist * math.cos(rad)
             oy = dist * math.sin(rad)
-            goal_vectors[robot] = (float(x_m) + ox, float(y_m) + oy)
+            # World/main-frame target for this robot then transformed into the
+            # robot's local frame using its heading offset vs main robot.
+            tx_main = float(x_m) + ox
+            ty_main = float(y_m) + oy
+            tx_robot, ty_robot = self._rotate_vector_into_robot_frame(
+                tx_main, ty_main, heading_rad
+            )
+            goal_vectors[robot] = (tx_robot, ty_robot)
 
         # Reference straight path is main robot's start->goal line.
         main_goal = goal_vectors.get(main_robot, (float(x_m), float(y_m)))
@@ -1025,9 +1071,13 @@ class TerminalOrchestrator(Node):
         for i, robot in enumerate(non_main_order):
             alt_side_hint[robot] = "left" if (i % 2 == 0) else "right"
 
-        # Base heading magnitude uses the main goal direction.
-        base_heading = math.atan2(float(main_goal[1]), float(main_goal[0])) if (abs(main_goal[0]) + abs(main_goal[1])) > 1e-9 else 0.0
-        theta2_abs = min(math.radians(60.0), max(math.radians(12.0), abs(base_heading) + math.radians(8.0)))
+        # All robots should finish facing the same direction.
+        # Use the main robot objective direction as the common final heading.
+        common_theta2_main = (
+            math.atan2(float(main_goal[1]), float(main_goal[0]))
+            if (abs(main_goal[0]) + abs(main_goal[1])) > 1e-9
+            else 0.0
+        )
 
         # Detour assignment rule:
         # - main robot: 0 (straight path)
@@ -1078,7 +1128,7 @@ class TerminalOrchestrator(Node):
                         dy=dy,
                         turn_side=side,
                         max_detour_m=max_detour_m,
-                        theta2_fixed=(+theta2_abs if side == "left" else -theta2_abs),
+                        theta2_fixed=(common_theta2_main - float(robot_heading_offset_rad.get(robot, 0.0))),
                         target_max_detour_m=float(detour_targets.get(robot, 0.0)),
                         ref_line_dir_xy=ref_line,
                     )
@@ -1135,12 +1185,13 @@ class TerminalOrchestrator(Node):
             "(distance + clock per robot)",
             "Side assignment: auto",
             "(dy-sign preferred, fallback)",
+            f"Common final heading={math.degrees(common_theta2_main):.1f} deg",
             f"MAX PATH OFFSET={max_detour_m:.2f} m",
             "",
             f"Est phase total: {est_total_seq:.2f} s",
             "",
             "Frame: robot-relative",
-            "(no heading alignment)",
+            "(heading offsets applied)",
         ]
 
         for robot in detected_robots:
@@ -1155,10 +1206,13 @@ class TerminalOrchestrator(Node):
             )
             if robot != main_robot:
                 summary.append(f"  side={side_for_robot.get(robot, 'left')}")
-                cfg = rel_cfg.get(robot, {"distance_m": 0.45, "clock": 3.0})
+                cfg = rel_cfg.get(robot, {"distance_m": 0.45, "clock": 3.0, "heading_clock": 12.0})
                 summary.append(
                     f"  rel={float(cfg.get('distance_m', 0.45)):.2f}m "
                     f"@ {float(cfg.get('clock', 3.0)):.1f} o'clock"
+                )
+                summary.append(
+                    f"  heading={float(cfg.get('heading_clock', 12.0)):.1f} o'clock"
                 )
 
         if not self._confirm(summary):
@@ -1194,6 +1248,8 @@ class TerminalOrchestrator(Node):
                     "speed": speed,
                     "relative_robot_config": rel_cfg,
                     "side_assignment_mode": "auto_dy_sign_with_fallback",
+                    "final_heading_mode": "shared_common_heading",
+                    "common_final_heading_deg": math.degrees(common_theta2_main),
                     "max_path_offset_m": max_detour_m,
                     "main_robot": main_robot,
                     "secondary_robot": secondary_robot,
@@ -1207,6 +1263,9 @@ class TerminalOrchestrator(Node):
                     robot: {
                         "dx": goal_vectors[robot][0],
                         "dy": goal_vectors[robot][1],
+                        "heading_offset_deg": math.degrees(
+                            robot_heading_offset_rad.get(robot, 0.0)
+                        ),
                         "theta1_deg": math.degrees(plans[robot].theta1),
                         "theta2_deg": math.degrees(plans[robot].theta2),
                         "length1_m": plans[robot].length1_m,

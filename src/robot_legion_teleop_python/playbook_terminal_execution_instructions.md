@@ -378,13 +378,16 @@ What it does:
 1. Uses all detected robots.
 2. Asks for:
    - base objective (`x`, `y`)
+     - defaults: `x=1.0`, `y=1.0` (non-zero 2D default objective)
    - speed scale
    - main robot selection (anchor/reference robot)
    - relative layout confirmation step:
-     - default: robots assumed in alphanumeric order with adjacent spacing `0.45 m`
+    - default: robots assumed in alphanumeric order with adjacent spacing `0.45 m`
+       (line formation; neighbor-to-neighbor spacing is 45 cm)
      - user can accept defaults or customize each non-main robot:
        - distance from main robot (meters)
        - clock direction from main robot (o'clock)
+       - heading direction relative to main robot (o'clock)
    - `MAX PATH OFFSET m` (default `0.8`)
 3. Uses deterministic linear algebra to compute trajectories:
    - main robot: one rotation + one forward/back movement (straight path to its objective)
@@ -394,6 +397,11 @@ What it does:
      - if `dy < 0` (target to robot-left), planner prefers `right` side
      - if `dy ~= 0`, planner uses alternating hint (`left,right,left,...`)
      - if preferred side is infeasible, planner retries opposite side automatically
+   - all robots converge to a shared final heading (same direction at destination),
+     using main robot objective heading as the common final heading
+   - when custom heading is provided for non-main robots, planner converts
+     destination vectors from main frame into each robot frame so the resulting
+     motion is aligned to the main robot direction
 4. Enforces detour policy from the main robot straight path:
    - main robot detour target = `0`
    - second robot (next detected after main) detour target = `MAX PATH OFFSET`
@@ -424,14 +432,23 @@ The planner rejects a candidate solution if:
 - any leg length is too small/non-forward,
 - detour from main straight path exceeds `MAX PATH OFFSET m`.
 
+Feasibility robustness:
+- Internal heading envelope for first-leg heading scan is up to `85 deg`,
+  which improves feasibility for larger lateral goals.
+- Second leg heading is fixed to the shared common final heading so all
+  robots end aligned in orientation.
+
 Important variables (playbook `1` and dispatch):
 - `MAX PATH OFFSET m` (UI input, default `0.8`): max allowable detour from main robot straight path.
 - default adjacent spacing assumption: `0.45 m` (used to prefill relative layout).
 - per-robot relative inputs (optional override):
   - `distance_m` from main robot
   - `clock` direction relative to main robot (`12` forward, `3` right, `6` back, `9` left)
+  - `heading_clock` direction relative to main robot (`12` means same direction)
 - side selection mode for non-main robots:
   - `auto_dy_sign_with_fallback` (preferred side from `dy`, fallback to opposite side if needed)
+- final heading mode:
+  - `shared_common_heading` (all robots end with the same heading)
 - `dispatch_timeout_s` (node param, default `1.0`): wait limit for action server availability before skipping robot.
 - `send_goal_response_timeout_s` (node param, default `1.0`): wait limit for goal-accept response before skipping robot.
 
@@ -445,5 +462,22 @@ Timeout skip behavior:
 
 ### Important frame note
 
-All vectors are robot-relative unless heading/global mode is added later.
-So this mode is best used when robots are staged with aligned initial heading.
+All vectors are command-executed robot-relative.
+When custom `heading_clock` is provided, terminal_orchestrator compensates by
+rotating each non-main robot target vector into that robot's local frame.
+
+Custom heading prompt format (per non-main robot):
+
+```text
+relative to the main robot (<main_robot>),
+<robot> is pointing toward ___ o'clock
+enter a value:
+```
+
+Example:
+
+```text
+relative to the main robot (robot2),
+robot1 is pointing toward ___ o'clock
+enter a value:
+```
