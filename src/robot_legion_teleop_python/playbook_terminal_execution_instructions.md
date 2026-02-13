@@ -107,7 +107,7 @@ You should see:
 
 UI controls:
 - `t` choose target robots (`all` or one robot)
-- `1` Coordinated 3-robot XY planner (randomized 2-leg linear algebra)
+- `1` Detected-robot XY planner (deterministic linear algebra)
 - `2` Execute ALL commands (validation sweep)
 - `3` Transit distance (meters -> duration estimate)
 - `4` Rotate degrees (degrees -> duration estimate)
@@ -125,6 +125,7 @@ Notes:
 - Dispatch is sent to all selected robots in parallel (simultaneous start intent).
 - Distance/time is intentionally approximate and consistent across robots.
 - For `Move objective (x, y)`: `x` maps to forward/back, `y` maps to right/left.
+- Playbook `1` specifically uses all detected robots (it does not limit to the currently selected target subset).
 
 ## 4) Manual CLI playbook commands (alternative)
 
@@ -258,7 +259,7 @@ Event types you will see:
 - `type: "audit_event"`: execution outcome per robot (result-style event).
 
 For option `1` specifically, you will see:
-- one high-level planning event with `command_id: "transit_xy_randomized_formation"`
+- one high-level planning event with `command_id: "transit_xy_deterministic_formation"`
 - then per-phase dispatch events (`rotate`, `transit`, `rotate`, `transit`) for each robot
 - then per-phase `audit_event` results for each robot
 
@@ -368,24 +369,29 @@ ros2 topic echo /fo/task
 ros2 topic echo /fo/audit
 ```
 
-## 7) Coordinated 3-Robot XY mode (option `1`)
+## 7) Detected-Robot Coordinated XY mode (option `1`)
 
-`1) Move objective (x,y)` now runs a coordinated planner intended for three robots.
+`1) Move objective (x,y)` now runs a coordinated planner over all currently detected robots.
 
 What it does:
-1. Requires exactly 3 selected robots.
+1. Uses all detected robots.
 2. Asks for:
    - base objective (`x`, `y`)
    - speed scale
    - robot spacing (default `0.45 m`)
-   - formation direction in radians (relative to anchor robot)
+   - formation direction in radians (relative to main robot)
+   - main robot selection (anchor/reference robot)
    - turn side (`left` or `right`) shared by all robots
    - `MAX PATH OFFSET m` (default `0.8`)
-   - random seed (or auto)
-   - anchor robot index
-3. Uses linear algebra + randomized heading pairs to compute two forward legs per robot.
-   - A shared second heading is enforced so all robots finish facing the same direction.
-4. Executes in synchronized phases:
+3. Uses deterministic linear algebra to compute trajectories:
+   - main robot: one rotation + one forward/back movement (straight path to its objective)
+   - other robots: two rotations + two forward/back movements
+4. Enforces detour policy from the main robot straight path:
+   - main robot detour target = `0`
+   - second robot (next detected after main) detour target = `MAX PATH OFFSET`
+   - additional robots get evenly spaced detour targets between `0` and `MAX PATH OFFSET`
+5. A shared second heading is enforced so all robots finish facing the same direction.
+6. Executes in synchronized phases:
    - phase 1: rotate
    - phase 2: forward leg 1
    - phase 3: rotate
@@ -401,24 +407,14 @@ l1 * [cos(theta1), sin(theta1)] + l2 * [cos(theta2), sin(theta2)] = [dx, dy]
 
 Where:
 - `[dx, dy]` is that robot's destination vector in robot-relative frame.
-- `theta1`, `theta2` are randomized heading angles (same turn side for all robots).
+- `theta1`, `theta2` are heading angles constrained to the same turn side for all robots.
 - `theta2` is shared across robots in a run (common final facing direction).
 - `l1`, `l2` are segment lengths solved from the 2x2 linear system.
 
-The planner rejects a sampled solution if:
+The planner rejects a candidate solution if:
 - matrix is singular,
 - any leg length is too small/non-forward,
-- detour from straight-line path exceeds `MAX PATH OFFSET m`.
-
-### Why random seed is included
-
-The random seed changes the sampled heading pairs, so trajectories vary while still
-respecting:
-- same turn-side constraint,
-- max detour bound,
-- exact endpoint solution of the linear system.
-
-Use a fixed seed to reproduce the same trajectory set later.
+- detour from main straight path exceeds `MAX PATH OFFSET m`.
 
 ### Important frame note
 

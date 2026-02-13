@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import math
-import random
 import re
 import sys
 import time
@@ -332,78 +331,96 @@ class TerminalOrchestrator(Node):
         l2 = inv21 * dx + inv22 * dy
         return (l1, l2)
 
-    def _plan_two_leg_randomized(
+    def _signed_distance_to_line(self, point_xy: Tuple[float, float], line_dir_xy: Tuple[float, float]) -> float:
+        """
+        Signed perpendicular distance from point to the infinite line through origin
+        with direction line_dir_xy.
+        """
+        px, py = point_xy
+        lx, ly = line_dir_xy
+        denom = math.hypot(lx, ly)
+        if denom < 1e-9:
+            return 0.0
+        return (px * ly - py * lx) / denom
+
+    def _plan_two_leg_deterministic(
         self,
         dx: float,
         dy: float,
         turn_side: str,
         max_detour_m: float,
-        rng: random.Random,
-        theta2_fixed: Optional[float] = None,
-        max_attempts: int = 250,
+        theta2_fixed: float,
+        target_max_detour_m: float,
+        ref_line_dir_xy: Tuple[float, float],
+        max_samples: int = 120,
     ) -> Optional[TwoLegPlan]:
         """
-        Build a two-leg trajectory with randomized headings, constrained by:
-        - both pre-forward rotations are on the same side (all-left or all-right),
-        - max detour from straight path does not exceed max_detour_m.
+        Deterministic two-leg planner using constrained linear algebra search.
 
-        Random numbers are injected in theta1/theta2 choices each attempt; the
-        first feasible solution is selected.
+        We keep a common final heading theta2_fixed for all robots, then scan theta1
+        (same turn side, smaller magnitude) and solve segment lengths from:
+          l1*u(theta1) + l2*u(theta2) = [dx, dy]
+
+        Candidate quality is based on closeness to target_max_detour_m while enforcing:
+        - forward+forward legs (l1,l2 > 0),
+        - same-side rotations,
+        - max detour bound.
         """
-        sign = +1.0 if turn_side == "left" else -1.0
-        target_heading = math.atan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-9 else 0.0
-
-        # Force both headings to remain on the requested side.
-        # We randomize within bounded windows to keep turns practical.
+        side_sign = +1.0 if turn_side == "left" else -1.0
         min_abs = math.radians(4.0)
         max_abs = math.radians(70.0)
-        base_h = max(min_abs, min(max_abs, abs(target_heading) + math.radians(10.0)))
-        theta2_common = theta2_fixed
-        if theta2_common is not None:
-            # Ensure fixed heading respects selected side and range bounds.
-            theta2_common = sign * min(max_abs, max(min_abs, abs(theta2_common)))
+        theta2 = side_sign * min(max_abs, max(min_abs, abs(theta2_fixed)))
+        h2 = abs(theta2)
 
-        for _ in range(max_attempts):
-            # Randomized heading pair (theta1 then theta2), same sign by construction.
-            # If theta2 is fixed globally, only theta1 is randomized (still distinct paths).
-            if theta2_common is not None:
-                theta2 = theta2_common
-                h2 = abs(theta2)
-                h1_max = max(min_abs + math.radians(3.0), h2 - math.radians(2.0))
-                if h1_max <= min_abs + 1e-6:
-                    continue
-                h1 = rng.uniform(min_abs, h1_max)
-                theta1 = sign * h1
-            else:
-                h1 = rng.uniform(min_abs, max(base_h * 0.75, min_abs + math.radians(3.0)))
-                h2 = rng.uniform(max(h1 + math.radians(3.0), min_abs), min(max_abs, h1 + math.radians(35.0)))
-                theta1 = sign * h1
-                theta2 = sign * h2
+        # theta1 must be smaller magnitude than theta2 for same-side second rotation.
+        h1_min = min_abs
+        h1_max = h2 - math.radians(2.0)
+        if h1_max <= h1_min:
+            return None
 
-            solved = self._solve_two_leg_lengths(dx, dy, theta1, theta2)
+        best: Optional[TwoLegPlan] = None
+        best_err = float("inf")
+
+        for i in range(max_samples):
+            ratio = i / max(1, max_samples - 1)
+            h1 = h1_min + ratio * (h1_max - h1_min)
+            theta1 = side_sign * h1
+
+            solved = self._solve_two_leg_lengths(dx=dx, dy=dy, theta1=theta1, theta2=theta2)
             if solved is None:
                 continue
             l1, l2 = solved
-
-            # Keep both forward legs non-trivial and forward to avoid backtracking.
+            # Enforce forward+forward style.
             if l1 <= 0.02 or l2 <= 0.02:
                 continue
 
-            # Intermediate waypoint after first segment.
-            wx = l1 * math.cos(theta1)
-            wy = l1 * math.sin(theta1)
-            detour = self._line_detour_distance((wx, wy), (dx, dy))
-            if detour > max_detour_m + 1e-9:
+            # Same-side second rotation check.
+            dtheta2 = theta2 - theta1
+            if side_sign > 0 and dtheta2 <= 0.0:
+                continue
+            if side_sign < 0 and dtheta2 >= 0.0:
                 continue
 
-            return TwoLegPlan(
+            wx = l1 * math.cos(theta1)
+            wy = l1 * math.sin(theta1)
+            d_waypoint = abs(self._signed_distance_to_line((wx, wy), ref_line_dir_xy))
+            d_goal = abs(self._signed_distance_to_line((dx, dy), ref_line_dir_xy))
+            # For a polyline, max distance from reference line occurs at segment endpoints.
+            achieved = max(d_waypoint, d_goal)
+            if achieved > max_detour_m + 1e-9:
+                continue
+
+            err = abs(achieved - target_max_detour_m)
+            if err < best_err:
+                best_err = err
+                best = TwoLegPlan(
                 theta1=theta1,
                 theta2=theta2,
                 length1_m=l1,
                 length2_m=l2,
-                max_detour_m=detour,
+                max_detour_m=achieved,
             )
-        return None
+        return best
 
     def _robot_goal_vectors_for_formation(
         self,
@@ -739,27 +756,23 @@ class TerminalOrchestrator(Node):
         self._print_screen(
             "PLAYBOOK: MOVE XY",
             [
-                "3-robot coordinated XY",
+                "detected-robot XY planner",
                 "x: forward(+) backward(-)",
                 "y: right(+) left(-)",
-                "Two-leg randomized planner",
-                "(same turn side)",
+                "main robot goes straight",
+                "others use 2-leg planner",
                 "",
                 "Type 'back' to cancel",
             ],
         )
-        robots_map = self._robots_map()
-        targets = self._target_actions(robots_map)
-        target_robots = [r for r, _ in targets]
-        if len(target_robots) != 3:
+        # Requirement: this playbook targets ALL currently detected robots.
+        detected_robots = sorted(self._robots_map().keys())
+        if not detected_robots:
             self._print_screen(
                 "MOVE XY REQUIREMENT",
                 [
-                    "This playbook requires exactly",
-                    "3 target robots.",
-                    "",
-                    f"Current target count: {len(target_robots)}",
-                    "Use 't' to pick 3 robots.",
+                    "No detected robots.",
+                    "Start robot bringup and retry.",
                 ],
             )
             self._pause()
@@ -789,71 +802,100 @@ class TerminalOrchestrator(Node):
 
         turn_side_raw = input("turn side [left/right] [left]: ").strip().lower()
         turn_side = turn_side_raw if turn_side_raw in ("left", "right") else "left"
-        seed_raw = input("random seed [auto]: ").strip()
-        seed = int(seed_raw) if seed_raw else int(time.time() * 1000) % 1_000_000_000
-        rng = random.Random(seed)
-        side_sign = +1.0 if turn_side == "left" else -1.0
-        base_heading = math.atan2(float(y_m), float(x_m)) if (abs(float(x_m)) + abs(float(y_m))) > 1e-9 else 0.0
-        # Shared terminal heading so all robots end facing the same direction.
-        theta2_common = side_sign * min(math.radians(60.0), max(math.radians(12.0), abs(base_heading) + math.radians(8.0)))
 
-        # Ask user to pick anchor robot for formation-relative offset model.
+        # Ask user to pick main robot (anchor); all destinations are defined relative to it.
         self._print_screen(
-            "ANCHOR SELECT",
+            "MAIN ROBOT SELECT",
             [
-                "Choose first robot (anchor)",
+                "Choose main robot (anchor)",
                 "Formation offsets are",
-                "interpreted relative to this",
-                "robot using spacing + dir.",
+                "interpreted from this robot.",
                 "",
-            ] + [f"{i+1}) {r}" for i, r in enumerate(target_robots)],
+            ] + [f"{i+1}) {r}" for i, r in enumerate(detected_robots)],
         )
-        anchor_choice = input("Anchor index [1]: ").strip()
-        anchor_idx = 1
-        if anchor_choice:
+        main_choice = input("Main robot index [1]: ").strip()
+        main_idx = 1
+        if main_choice:
             try:
-                anchor_idx = int(anchor_choice)
+                main_idx = int(main_choice)
             except ValueError:
-                anchor_idx = 1
-        anchor_idx = min(max(anchor_idx, 1), len(target_robots))
-        anchor_robot = target_robots[anchor_idx - 1]
+                main_idx = 1
+        main_idx = min(max(main_idx, 1), len(detected_robots))
+        main_robot = detected_robots[main_idx - 1]
 
         goal_vectors = self._robot_goal_vectors_for_formation(
-            robots=target_robots,
-            anchor_robot=anchor_robot,
+            robots=detected_robots,
+            anchor_robot=main_robot,
             x_m=float(x_m),
             y_m=float(y_m),
             spacing_m=float(spacing_m),
             formation_dir_rad=float(formation_dir_rad),
         )
 
+        # Reference straight path is main robot's start->goal line.
+        main_goal = goal_vectors.get(main_robot, (float(x_m), float(y_m)))
+        ref_line = main_goal if math.hypot(main_goal[0], main_goal[1]) > 1e-9 else (1.0, 0.0)
+
+        side_sign = +1.0 if turn_side == "left" else -1.0
+        base_heading = math.atan2(float(main_goal[1]), float(main_goal[0])) if (abs(main_goal[0]) + abs(main_goal[1])) > 1e-9 else 0.0
+        # Shared terminal heading for non-main robots so all end with same orientation.
+        theta2_common = side_sign * min(math.radians(60.0), max(math.radians(12.0), abs(base_heading) + math.radians(8.0)))
+
+        # Detour assignment rule:
+        # - main robot: 0 (straight path)
+        # - "second robot": next detected robot (excluding main) gets max_detour_m
+        # - remaining robots: evenly spaced detour levels between 0 and max_detour_m
+        detour_targets: Dict[str, float] = {main_robot: 0.0}
+        non_main = [r for r in detected_robots if r != main_robot]
+        secondary_robot = non_main[0] if non_main else None
+        if secondary_robot:
+            detour_targets[secondary_robot] = max_detour_m
+        remaining = [r for r in non_main if r != secondary_robot]
+        if remaining:
+            step = max_detour_m / float(len(remaining) + 1)
+            for i, robot in enumerate(remaining, start=1):
+                detour_targets[robot] = i * step
+
         plans: Dict[str, TwoLegPlan] = {}
         failures: List[str] = []
-        for robot in target_robots:
+        for robot in detected_robots:
             dx, dy = goal_vectors[robot]
-            plan = self._plan_two_leg_randomized(
-                dx=dx,
-                dy=dy,
-                turn_side=turn_side,
-                max_detour_m=max_detour_m,
-                rng=rng,
-                theta2_fixed=theta2_common,
-            )
-            if plan is None:
-                failures.append(robot)
+            if robot == main_robot:
+                # Main robot path: one rotate + one transit (straight to objective).
+                heading = math.atan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-9 else 0.0
+                dist = math.hypot(dx, dy)
+                plans[robot] = TwoLegPlan(
+                    theta1=heading,
+                    theta2=heading,
+                    length1_m=dist,
+                    length2_m=0.0,
+                    max_detour_m=abs(self._signed_distance_to_line((dx, dy), ref_line)),
+                )
             else:
-                plans[robot] = plan
+                plan = self._plan_two_leg_deterministic(
+                    dx=dx,
+                    dy=dy,
+                    turn_side=turn_side,
+                    max_detour_m=max_detour_m,
+                    theta2_fixed=theta2_common,
+                    target_max_detour_m=float(detour_targets.get(robot, 0.0)),
+                    ref_line_dir_xy=ref_line,
+                )
+                if plan is None:
+                    failures.append(robot)
+                else:
+                    plans[robot] = plan
 
         if failures:
             self._print_screen(
                 "PLANNER FAILED",
                 [
-                    "No feasible randomized plan",
+                    "No feasible deterministic plan",
                     "under current constraints for:",
                     ", ".join(failures),
                     "",
                     "Try: larger MAX PATH OFFSET",
-                    "or different turn side/seed.",
+                    "or different turn side.",
                 ],
             )
             self._pause()
@@ -868,18 +910,17 @@ class TerminalOrchestrator(Node):
             t2 = abs(p.length2_m) / max(1e-6, self.base_linear_mps * speed)
             est_total_seq = max(est_total_seq, r1 + t1 + r2 + t2)
 
-        target_text = self.selected_robot or "ALL"
+        target_text = f"detected={len(detected_robots)}"
         summary = [
             f"Target: {target_text}",
-            "Mode: 3-robot coordinated XY",
+            "Mode: detected-robot XY",
             "",
-            f"Anchor: {anchor_robot}",
+            f"Main robot: {main_robot}",
             f"Base x={x_m:.2f} y={y_m:.2f}",
             f"Spacing={spacing_m:.2f} m",
             f"Formation dir={formation_dir_rad:.3f} rad",
             f"Turn side={turn_side}",
             f"MAX PATH OFFSET={max_detour_m:.2f} m",
-            f"Seed={seed}",
             "",
             f"Est phase total: {est_total_seq:.2f} s",
             "",
@@ -887,14 +928,15 @@ class TerminalOrchestrator(Node):
             "(no heading alignment)",
         ]
 
-        for robot in target_robots:
+        for robot in detected_robots:
             dx, dy = goal_vectors[robot]
             p = plans[robot]
             summary.append(f"{robot}: dx={dx:.2f} dy={dy:.2f}")
             summary.append(
                 f"  th1={math.degrees(p.theta1):.1f}deg "
                 f"th2={math.degrees(p.theta2):.1f}deg "
-                f"detour={p.max_detour_m:.2f}m"
+                f"detour={p.max_detour_m:.2f}m "
+                f"target={detour_targets.get(robot, 0.0):.2f}m"
             )
 
         if not self._confirm(summary):
@@ -918,12 +960,12 @@ class TerminalOrchestrator(Node):
             {
                 "type": "playbook_command",
                 "intent_id": f"term_xy_plan_{now}",
-                "command_id": "transit_xy_randomized_formation",
+                "command_id": "transit_xy_deterministic_formation",
                 "platform": {
                     "adapter_type": "terminal_orchestrator",
                     "platform_family": "robot_legion_teleop_python",
                 },
-                "targets": target_robots,
+                "targets": detected_robots,
                 "parameters": {
                     "x_m": x_m,
                     "y_m": y_m,
@@ -932,13 +974,13 @@ class TerminalOrchestrator(Node):
                     "formation_dir_rad": formation_dir_rad,
                     "turn_side": turn_side,
                     "max_path_offset_m": max_detour_m,
-                    "seed": seed,
-                    "anchor_robot": anchor_robot,
+                    "main_robot": main_robot,
+                    "secondary_robot": secondary_robot,
                 },
                 "trace": {
                     "translator": "terminal_orchestrator",
                     "confidence": 1.0,
-                    "explanation": "randomized two-leg linear algebra planner",
+                    "explanation": "deterministic two-leg linear algebra planner",
                 },
                 "plans": {
                     robot: {
@@ -949,8 +991,9 @@ class TerminalOrchestrator(Node):
                         "length1_m": plans[robot].length1_m,
                         "length2_m": plans[robot].length2_m,
                         "max_detour_m": plans[robot].max_detour_m,
+                        "target_detour_m": detour_targets.get(robot, 0.0),
                     }
-                    for robot in target_robots
+                    for robot in detected_robots
                 },
             },
         )
@@ -962,7 +1005,7 @@ class TerminalOrchestrator(Node):
             return _build_phase_goal(robot, "p1_rotate", "rotate", params)
 
         phase_reports.extend(self._dispatch_goal(build_phase1))
-        if any((not r.success) for r in phase_reports[-len(target_robots):]):
+        if any((not r.success) for r in phase_reports[-len(detected_robots):]):
             self._render_reports(phase_reports)
             return
 
@@ -973,7 +1016,7 @@ class TerminalOrchestrator(Node):
             return _build_phase_goal(robot, "p2_transit", "transit", params)
 
         phase_reports.extend(self._dispatch_goal(build_phase2))
-        if any((not r.success) for r in phase_reports[-len(target_robots):]):
+        if any((not r.success) for r in phase_reports[-len(detected_robots):]):
             self._render_reports(phase_reports)
             return
 
@@ -984,7 +1027,7 @@ class TerminalOrchestrator(Node):
             return _build_phase_goal(robot, "p3_rotate", "rotate", params)
 
         phase_reports.extend(self._dispatch_goal(build_phase3))
-        if any((not r.success) for r in phase_reports[-len(target_robots):]):
+        if any((not r.success) for r in phase_reports[-len(detected_robots):]):
             self._render_reports(phase_reports)
             return
 
