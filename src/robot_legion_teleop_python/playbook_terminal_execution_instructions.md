@@ -4,7 +4,8 @@ This guide shows how to run playbooks from a laptop terminal against multiple ro
 
 Assumptions:
 - ROS 2 Jazzy on Ubuntu 24.04.
-- Linux username on each robot equals robot name (for example: `robot1`, `robot2`, `robot3`).
+- Robot name is derived from Linux username (`$USER`) by `robot_bringup.launch.py`.
+- Linux username on each robot should match a key in `config/robot_profiles.yaml` (for example: `robot1`, `robot2`, `robot3`).
 - All machines are on the same network and use the same ROS domain ID.
 
 ## 1) On each robot Pi (fresh SSH session)
@@ -19,8 +20,28 @@ source "$HOME/ros2_ws/install/setup.bash"
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
-export ROBOT_NAME="${ROBOT_NAME:-$USER}"
 export PROFILES_PATH="${PROFILES_PATH:-$HOME/ros2_ws/src/robot_legion_teleop_python/config/robot_profiles.yaml}"
+```
+
+Important:
+- If a shell already has `ROS_DOMAIN_ID=17`, the `:-42` pattern will keep `17`.
+- To force consistent values every time, use this instead:
+
+```bash
+export ROS_DOMAIN_ID=42
+export ROS_LOCALHOST_ONLY=0
+export PROFILES_PATH="$HOME/ros2_ws/src/robot_legion_teleop_python/config/robot_profiles.yaml"
+```
+
+Note:
+- `ROBOT_NAME` is not consumed by current `robot_bringup.launch.py`.
+- Runtime robot namespace/action path is based on Linux username (`$USER`), e.g. `/<user>/execute_playbook`.
+- If `$USER` does not exist in `robot_profiles.yaml`, motor driver may fall back to mock mode and the robot will not physically move.
+
+Verify robot shell environment:
+
+```bash
+env | grep -E 'ROS_DOMAIN_ID|ROS_LOCALHOST_ONLY|ROS_AUTOMATIC_DISCOVERY_RANGE|ROS_STATIC_PEERS|RMW_IMPLEMENTATION|ROS_DISTRO|USER'
 ```
 
 Launch robot nodes (motor driver, heartbeat, executor):
@@ -44,6 +65,19 @@ source "$HOME/ros2_ws/install/setup.bash"
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
+```
+
+To force known-good values (recommended), run:
+
+```bash
+export ROS_DOMAIN_ID=42
+export ROS_LOCALHOST_ONLY=0
+```
+
+Verify laptop shell environment:
+
+```bash
+env | grep -E 'ROS_DOMAIN_ID|ROS_LOCALHOST_ONLY|ROS_AUTOMATIC_DISCOVERY_RANGE|ROS_STATIC_PEERS|RMW_IMPLEMENTATION|ROS_DISTRO|USER'
 ```
 
 Discover action servers:
@@ -154,4 +188,3 @@ On a robot terminal:
 ```bash
 tail -f /tmp/robot_"${USER}"_audit.jsonl
 ```
-
