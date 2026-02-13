@@ -118,8 +118,29 @@ UI controls:
 - `2` Execute ALL commands (validation sweep)
 - `3` Transit distance (meters -> duration estimate)
 - `4` Rotate degrees (degrees -> duration estimate)
+- `s` Playbook sequence (queue multiple playbooks before running)
 - `r` refresh discovery
 - `q` quit
+
+Playbook sequence submenu:
+- Header shows `PLAYBOOK SEQUENCE` (separate from the main menu header).
+- Lets you queue from the same playbooks (`1/2/3/4`) and run them in order.
+- Queue controls:
+  - `e` execute queued playbooks
+  - `d` delete last queued playbook
+  - `c` clear queue
+  - `b` back
+- Sequence execute behavior (`e`):
+  - non-interactive per step (no per-step pause, no per-step confirmation).
+  - one final `SEQUENCE SUMMARY` screen after the queue run.
+  - one final pretty-printed (indented) JSON block for copy/paste.
+- Playbook `1` in sequence mode:
+  - fully queueable now.
+  - captures all playbook-1 variables up front when added:
+    - `x`, `y`, `speed`, `MAX PATH OFFSET`,
+    - main robot selection,
+    - per-robot relative config (distance, clock, heading clock).
+  - executes non-interactively during sequence run using those captured values.
 
 Execution flow:
 1. Choose target robots.

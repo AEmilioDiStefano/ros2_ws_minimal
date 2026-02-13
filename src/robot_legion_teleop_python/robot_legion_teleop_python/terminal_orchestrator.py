@@ -19,7 +19,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import rclpy
 from rclpy.action import ActionClient
@@ -797,9 +797,13 @@ class TerminalOrchestrator(Node):
             rclpy.spin_once(self, timeout_sec=min(step_sec, deadline - now))
         return done_fn()
 
-    def _dispatch_goal(self, goal_factory) -> List[GoalReport]:
+    def _dispatch_goal(self, goal_factory, target_robots: Optional[List[str]] = None) -> List[GoalReport]:
         robots_map = self._robots_map()
-        targets = self._target_actions(robots_map)
+        if target_robots is None:
+            targets = self._target_actions(robots_map)
+        else:
+            wanted = {str(r) for r in target_robots}
+            targets = [(r, a) for r, a in robots_map.items() if r in wanted]
         reports: List[GoalReport] = []
 
         if not targets:
@@ -999,7 +1003,7 @@ class TerminalOrchestrator(Node):
                 self.selected_robot = robots[idx - 1]
                 return
 
-    def _render_reports(self, reports: List[GoalReport]):
+    def _render_reports(self, reports: List[GoalReport], pause: bool = True):
         lines = ["Execution report", ""]
         if not reports:
             lines.extend(["No target robots found."])
@@ -1011,100 +1015,456 @@ class TerminalOrchestrator(Node):
                     lines.append(f"{rep.robot}: FAIL")
                     lines.append(f"  {rep.reason}")
         self._print_screen("RESULT", lines)
-        self._pause()
+        if pause:
+            self._pause()
 
     def _confirm(self, summary_lines: List[str]) -> bool:
         self._print_screen("EXECUTION SUMMARY", summary_lines + ["", "EXECUTE? y/n"])
         answer = input("> ").strip().lower()
         return answer in ("y", "yes")
 
+    # ---------------- Playbook sequence submenu ----------------
+
+    def _collect_sequence_entry(self, choice: str) -> Optional[Dict[str, Any]]:
+        """
+        Build a queued sequence entry for the selected playbook.
+
+        Notes:
+        - Playbook 1 remains fully interactive at run time because it has a large
+          planning form (main robot, relative config, heading clocks, etc).
+        - Playbooks 2/3/4 capture variables up front and execute later.
+        """
+        if choice == "1":
+            detected_robots = sorted(self._robots_map().keys())
+            if not detected_robots:
+                self._print_screen(
+                    "MOVE XY REQUIREMENT",
+                    [
+                        "No detected robots.",
+                        "Start robot bringup and retry.",
+                    ],
+                )
+                self._pause()
+                return None
+
+            x_m = self._prompt_float("x meters", default=1.0)
+            if x_m is None:
+                return None
+            y_m = self._prompt_float("y meters", default=1.0)
+            if y_m is None:
+                return None
+            speed = self._prompt_float("speed scale", default=self.default_speed_scale, allow_zero=False)
+            if speed is None:
+                return None
+            speed = max(0.05, min(1.5, float(speed)))
+            max_detour_m = self._prompt_float("MAX PATH OFFSET m", default=0.8, allow_zero=False)
+            if max_detour_m is None:
+                return None
+            max_detour_m = max(0.05, float(max_detour_m))
+
+            self._print_screen(
+                "MAIN ROBOT SELECT",
+                [
+                    "Choose main robot (anchor)",
+                    "Formation offsets are",
+                    "interpreted from this robot.",
+                    "",
+                ] + [f"{i+1}) {r}" for i, r in enumerate(detected_robots)],
+            )
+            while True:
+                main_choice = input("Main robot index [1]: ").strip()
+                if main_choice == "":
+                    main_idx = 1
+                    break
+                if main_choice.lower() in ("b", "back", "q", "quit", "0"):
+                    return None
+                try:
+                    parsed = int(main_choice)
+                except ValueError:
+                    print("Invalid index. Enter a number from the list.")
+                    continue
+                if 1 <= parsed <= len(detected_robots):
+                    main_idx = parsed
+                    break
+                print(f"Invalid index. Choose 1..{len(detected_robots)}.")
+            main_robot = detected_robots[main_idx - 1]
+
+            default_rel = self._default_relative_robot_config(
+                detected_robots=detected_robots,
+                main_robot=main_robot,
+                default_spacing_m=0.45,
+            )
+            rel_cfg = self._prompt_relative_robot_config(
+                detected_robots=detected_robots,
+                main_robot=main_robot,
+                defaults=default_rel,
+            )
+            if rel_cfg is None:
+                return None
+
+            return {
+                "playbook": "move_xy",
+                "label": "Move objective (x,y)",
+                "params": {
+                    "detected_robots": detected_robots,
+                    "x_m": float(x_m),
+                    "y_m": float(y_m),
+                    "speed": float(speed),
+                    "max_detour_m": float(max_detour_m),
+                    "main_robot": str(main_robot),
+                    "rel_cfg": rel_cfg,
+                },
+                "deferred_input": False,
+            }
+        if choice == "2":
+            speed = self._prompt_float("speed scale", default=0.8, allow_zero=False)
+            if speed is None:
+                return None
+            speed = max(0.05, min(1.5, float(speed)))
+            return {
+                "playbook": "execute_all_commands",
+                "label": "Execute ALL commands",
+                "params": {"speed": speed},
+                "deferred_input": False,
+            }
+        if choice == "3":
+            meters = self._prompt_float("distance meters", default=1.0, allow_zero=False)
+            if meters is None:
+                return None
+            speed = self._prompt_float("speed scale", default=self.default_speed_scale, allow_zero=False)
+            if speed is None:
+                return None
+            speed = max(0.05, min(1.5, float(speed)))
+            return {
+                "playbook": "transit_distance",
+                "label": "Transit distance",
+                "params": {"meters": float(meters), "speed": speed},
+                "deferred_input": False,
+            }
+        if choice == "4":
+            degrees = self._prompt_float("degrees", default=45.0, allow_zero=False)
+            if degrees is None:
+                return None
+            speed = self._prompt_float("speed scale", default=self.default_speed_scale, allow_zero=False)
+            if speed is None:
+                return None
+            speed = max(0.05, min(1.5, float(speed)))
+            return {
+                "playbook": "rotate_degrees",
+                "label": "Rotate degrees",
+                "params": {"degrees": float(degrees), "speed": speed},
+                "deferred_input": False,
+            }
+        return None
+
+    def _execute_sequence_entry(self, entry: Dict[str, Any], seq_index: int, seq_total: int) -> Dict[str, Any]:
+        playbook = str(entry.get("playbook", ""))
+        if playbook == "move_xy":
+            params = entry.get("params", {}) or {}
+            run = self._run_move_xy_with_params(
+                detected_robots=[str(r) for r in list(params.get("detected_robots", []))],
+                x_m=float(params.get("x_m", 1.0)),
+                y_m=float(params.get("y_m", 1.0)),
+                speed=float(params.get("speed", self.default_speed_scale)),
+                max_detour_m=float(params.get("max_detour_m", 0.8)),
+                main_robot=str(params.get("main_robot", "")),
+                rel_cfg=dict(params.get("rel_cfg", {}) or {}),
+                require_confirm=False,
+                render_result=False,
+            )
+            return {
+                "step": seq_index,
+                "playbook": "move_xy",
+                "label": "Move objective (x,y)",
+                "status": "completed" if bool(run.get("ok", False)) else "failed",
+                "reason": str(run.get("reason", "")),
+                "reports": list(run.get("reports", [])),
+            }
+
+        if playbook == "execute_all_commands":
+            params = entry.get("params", {}) or {}
+            speed = max(0.05, min(1.5, float(params.get("speed", 0.8))))
+            # Reuse existing implementation behavior by routing through direct command plan.
+            # Keep this as the same primitive sweep and target semantics as menu option 2.
+            now = int(time.time())
+            reports: List[GoalReport] = []
+            command_plan = [
+                ("hold", {"duration_s": 0.5, "speed": speed}),
+                ("transit", {"direction": "forward", "duration_s": 0.8, "speed": speed}),
+                ("rotate", {"direction": "left", "duration_s": 0.5, "speed": speed}),
+                ("strafe", {"direction": "right", "duration_s": 0.7, "speed": speed}),
+                ("diagonal", {"direction": "fwd_right", "duration_s": 0.7, "speed": speed}),
+                ("turn", {"direction": "left", "duration_s": 0.7, "speed": speed}),
+                ("transit_xy", {"north_m": 0.25, "east_m": 0.15, "speed": speed}),
+            ]
+            for idx, (command_id, cparams) in enumerate(command_plan, start=1):
+                phase = f"seq{seq_index}_c{idx}_{command_id}"
+
+                def build_goal(robot: str, cid=command_id, p=cparams, ph=phase) -> ExecutePlaybook.Goal:
+                    g = ExecutePlaybook.Goal()
+                    g.intent_id = f"term_seq_all_{ph}_{robot}_{now}"
+                    g.command_id = cid
+                    g.vehicle_ids = [robot]
+                    if cid == "transit_xy":
+                        g.north_m = float(p.get("north_m", 0.0))
+                        g.east_m = float(p.get("east_m", 0.0))
+                    g.parameters_json = json.dumps(p, separators=(",", ":"))
+                    return g
+
+                reports.extend(self._dispatch_goal(build_goal))
+            return {
+                "step": seq_index,
+                "playbook": "execute_all_commands",
+                "label": "Execute ALL commands",
+                "status": "completed",
+                "reports": reports,
+            }
+
+        if playbook == "transit_distance":
+            params = entry.get("params", {}) or {}
+            meters = float(params.get("meters", 1.0))
+            speed = max(0.05, min(1.5, float(params.get("speed", self.default_speed_scale))))
+            direction = "forward" if meters >= 0.0 else "backward"
+            now = int(time.time())
+
+            def build_goal(robot: str) -> ExecutePlaybook.Goal:
+                g = ExecutePlaybook.Goal()
+                g.intent_id = f"term_seq_transit_{seq_index}_{robot}_{now}"
+                g.command_id = "transit"
+                g.vehicle_ids = [robot]
+                linear_scale, _ = self._duration_scales_for_robot(robot)
+                duration_s = (
+                    abs(meters) / max(1e-6, self.base_linear_mps * speed)
+                ) * linear_scale
+                g.parameters_json = json.dumps(
+                    {
+                        "direction": direction,
+                        "duration_s": float(duration_s),
+                        "speed": float(speed),
+                    },
+                    separators=(",", ":"),
+                )
+                return g
+
+            reports = self._dispatch_goal(build_goal)
+            return {
+                "step": seq_index,
+                "playbook": "transit_distance",
+                "label": "Transit distance",
+                "status": "completed",
+                "reports": reports,
+            }
+
+        if playbook == "rotate_degrees":
+            params = entry.get("params", {}) or {}
+            degrees = float(params.get("degrees", 45.0))
+            speed = max(0.05, min(1.5, float(params.get("speed", self.default_speed_scale))))
+            direction = "left" if degrees >= 0.0 else "right"
+            radians = abs(degrees) * math.pi / 180.0
+            now = int(time.time())
+
+            def build_goal(robot: str) -> ExecutePlaybook.Goal:
+                g = ExecutePlaybook.Goal()
+                g.intent_id = f"term_seq_rotate_{seq_index}_{robot}_{now}"
+                g.command_id = "rotate"
+                g.vehicle_ids = [robot]
+                _, angular_scale = self._duration_scales_for_robot(robot)
+                duration_s = (
+                    radians / max(1e-6, self.base_angular_rps * speed)
+                ) * angular_scale
+                g.parameters_json = json.dumps(
+                    {
+                        "direction": direction,
+                        "duration_s": float(duration_s),
+                        "speed": float(speed),
+                    },
+                    separators=(",", ":"),
+                )
+                return g
+
+            reports = self._dispatch_goal(build_goal)
+            return {
+                "step": seq_index,
+                "playbook": "rotate_degrees",
+                "label": "Rotate degrees",
+                "status": "completed",
+                "reports": reports,
+            }
+        return {
+            "step": seq_index,
+            "playbook": playbook,
+            "label": str(entry.get("label", playbook)),
+            "status": "skipped",
+            "reason": "unsupported sequence entry",
+            "reports": [],
+        }
+
+    def _playbook_sequence_menu(self):
+        queue: List[Dict[str, Any]] = []
+        while rclpy.ok():
+            lines = [
+                "Build and run playbook queue",
+                "",
+                "Enter 'back' or '0' to",
+                "return to the main menu",
+                "",
+                "Add playbook:",
+                "1) Move objective (x,y)",
+                "2) Execute ALL commands",
+                "3) Transit distance",
+                "4) Rotate degrees",
+                "",
+                "e) Execute queued",
+                "d) Delete last queued",
+                "c) Clear queue",
+                "b) Back",
+            ]
+            if queue:
+                lines.append("")
+                lines.append("Queued:")
+                for i, item in enumerate(queue, start=1):
+                    label = str(item.get("label", "playbook"))
+                    lines.append(f"{i}) {label}")
+            else:
+                lines.append("")
+                lines.append("Queue empty")
+
+            self._print_screen("EXECUTE PLAYBOOK SEQUENCE", lines)
+            choice = input("Choice: ").strip().lower()
+
+            if choice in ("0", "b", "back", "q", "quit"):
+                return
+            if choice in ("d", "del", "delete"):
+                if queue:
+                    queue.pop()
+                continue
+            if choice in ("c", "clear"):
+                queue.clear()
+                continue
+            if choice in ("e", "exec", "execute"):
+                if not queue:
+                    self._print_screen("EXECUTE PLAYBOOK SEQUENCE", ["Queue is empty."])
+                    self._pause()
+                    continue
+                if not self._confirm(
+                    [
+                        f"Queued playbooks: {len(queue)}",
+                        "Execute in listed order?",
+                    ]
+                ):
+                    continue
+                # Snapshot queue for this run.
+                to_run = list(queue)
+                step_results: List[Dict[str, Any]] = []
+                for idx, entry in enumerate(to_run, start=1):
+                    step_results.append(
+                        self._execute_sequence_entry(entry, seq_index=idx, seq_total=len(to_run))
+                    )
+
+                total_reports = 0
+                ok_reports = 0
+                fail_reports = 0
+                skipped_steps = 0
+                lines = [
+                    f"Steps executed: {len(step_results)}",
+                    "",
+                ]
+                for sr in step_results:
+                    label = str(sr.get("label", sr.get("playbook", "playbook")))
+                    status = str(sr.get("status", "unknown"))
+                    if status == "skipped":
+                        skipped_steps += 1
+                        lines.append(f"{sr.get('step', '?')}) {label}: SKIP")
+                        reason = str(sr.get("reason", "")).strip()
+                        if reason:
+                            lines.append(f"  {reason}")
+                        continue
+                    reports = list(sr.get("reports", []))
+                    total_reports += len(reports)
+                    oks = sum(1 for r in reports if r.accepted and r.success)
+                    fails = len(reports) - oks
+                    ok_reports += oks
+                    fail_reports += fails
+                    lines.append(
+                        f"{sr.get('step', '?')}) {label}: "
+                        f"OK={oks} FAIL={fails}"
+                    )
+
+                lines.extend(
+                    [
+                        "",
+                        f"Robot reports: {total_reports}",
+                        f"Total OK: {ok_reports}",
+                        f"Total FAIL: {fail_reports}",
+                        f"Skipped steps: {skipped_steps}",
+                    ]
+                )
+                self._print_screen("SEQUENCE SUMMARY", lines)
+
+                sequence_json = {
+                    "type": "playbook_sequence_result",
+                    "queued_steps": len(step_results),
+                    "robot_reports_total": total_reports,
+                    "ok_total": ok_reports,
+                    "fail_total": fail_reports,
+                    "skipped_steps": skipped_steps,
+                    "steps": [
+                        {
+                            "step": sr.get("step"),
+                            "playbook": sr.get("playbook"),
+                            "label": sr.get("label"),
+                            "status": sr.get("status"),
+                            "reason": sr.get("reason", ""),
+                            "reports": [
+                                {
+                                    "robot": r.robot,
+                                    "accepted": r.accepted,
+                                    "success": r.success,
+                                    "reason": r.reason,
+                                }
+                                for r in list(sr.get("reports", []))
+                            ],
+                        }
+                        for sr in step_results
+                    ],
+                }
+                print(json.dumps(sequence_json, indent=2, sort_keys=True))
+                sys.stdout.flush()
+                self._pause()
+                continue
+
+            if choice in ("1", "2", "3", "4"):
+                entry = self._collect_sequence_entry(choice)
+                if entry is not None:
+                    queue.append(entry)
+                continue
+
     # ---------------- Playbooks ----------------
 
-    def _playbook_move_xy(self):
-        self._print_screen(
-            "PLAYBOOK: MOVE XY",
-            [
-                "detected-robot XY planner",
-                "x: forward(+) backward(-)",
-                "y: right(+) left(-)",
-                "main robot goes straight",
-                "others use 2-leg planner",
-                "",
-                "Type 'back' to cancel",
-            ],
-        )
-        # Requirement: this playbook targets ALL currently detected robots.
-        detected_robots = sorted(self._robots_map().keys())
+    def _run_move_xy_with_params(
+        self,
+        detected_robots: List[str],
+        x_m: float,
+        y_m: float,
+        speed: float,
+        max_detour_m: float,
+        main_robot: str,
+        rel_cfg: Dict[str, Dict[str, float]],
+        require_confirm: bool = True,
+        render_result: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Shared executor for playbook 1.
+
+        Used by:
+        - interactive playbook 1 screen
+        - non-interactive sequence mode
+        """
+        detected_robots = [str(r) for r in detected_robots]
         if not detected_robots:
-            self._print_screen(
-                "MOVE XY REQUIREMENT",
-                [
-                    "No detected robots.",
-                    "Start robot bringup and retry.",
-                ],
-            )
-            self._pause()
-            return
-
-        x_m = self._prompt_float("x meters", default=1.0)
-        if x_m is None:
-            return
-        # Default y to 1.0 so the default objective is genuinely 2D by default.
-        y_m = self._prompt_float("y meters", default=1.0)
-        if y_m is None:
-            return
-        speed = self._prompt_float("speed scale", default=self.default_speed_scale, allow_zero=False)
-        if speed is None:
-            return
-        speed = max(0.05, min(1.5, speed))
-        max_detour_m = self._prompt_float("MAX PATH OFFSET m", default=0.8, allow_zero=False)
-        if max_detour_m is None:
-            return
-        max_detour_m = max(0.05, float(max_detour_m))
-
-        # Ask user to pick main robot (anchor); all destinations are defined relative to it.
-        self._print_screen(
-            "MAIN ROBOT SELECT",
-            [
-                "Choose main robot (anchor)",
-                "Formation offsets are",
-                "interpreted from this robot.",
-                "",
-            ] + [f"{i+1}) {r}" for i, r in enumerate(detected_robots)],
-        )
-        # Mitigate invalid selection by requiring a valid index or explicit default enter.
-        while True:
-            main_choice = input("Main robot index [1]: ").strip()
-            if main_choice == "":
-                main_idx = 1
-                break
-            if main_choice.lower() in ("b", "back", "q", "quit"):
-                return
-            try:
-                parsed = int(main_choice)
-            except ValueError:
-                print("Invalid index. Enter a number from the list.")
-                continue
-            if 1 <= parsed <= len(detected_robots):
-                main_idx = parsed
-                break
-            print(f"Invalid index. Choose 1..{len(detected_robots)}.")
-        main_robot = detected_robots[main_idx - 1]
-
-        # Relative robot configuration prompt:
-        # defaults are auto-derived from detected order with 0.45 m adjacent spacing.
-        default_rel = self._default_relative_robot_config(
-            detected_robots=detected_robots,
-            main_robot=main_robot,
-            default_spacing_m=0.45,
-        )
-        rel_cfg = self._prompt_relative_robot_config(
-            detected_robots=detected_robots,
-            main_robot=main_robot,
-            defaults=default_rel,
-        )
-        if rel_cfg is None:
-            return
+            return {"ok": False, "reason": "no detected robots", "reports": []}
+        if main_robot not in detected_robots:
+            return {"ok": False, "reason": f"main robot '{main_robot}' not in detected robots", "reports": []}
 
         # Build per-robot target vectors from base objective + relative offsets.
         goal_vectors: Dict[str, Tuple[float, float]] = {main_robot: (float(x_m), float(y_m))}
@@ -1228,19 +1588,14 @@ class TerminalOrchestrator(Node):
                     plans[robot] = plan
 
         if failures:
-            self._print_screen(
-                "PLANNER FAILED",
-                [
-                    "No feasible deterministic plan",
-                    "under current constraints for:",
-                    ", ".join(failures),
-                    "",
-                    "Try: larger MAX PATH OFFSET",
-                    "or smaller spacing offset.",
-                ],
-            )
-            self._pause()
-            return
+            return {
+                "ok": False,
+                "reason": (
+                    "No feasible deterministic plan under current constraints for: "
+                    + ", ".join(failures)
+                ),
+                "reports": [],
+            }
 
         est_total_seq = 0.0
         for robot in detected_robots:
@@ -1292,8 +1647,8 @@ class TerminalOrchestrator(Node):
                     f"  heading={float(cfg.get('heading_clock', 12.0)):.1f} o'clock"
                 )
 
-        if not self._confirm(summary):
-            return
+        if require_confirm and (not self._confirm(summary)):
+            return {"ok": False, "reason": "user cancelled", "reports": []}
 
         now = int(time.time())
         phase_reports: List[GoalReport] = []
@@ -1363,10 +1718,11 @@ class TerminalOrchestrator(Node):
             )
             return _build_phase_goal(robot, "p1_rotate", "rotate", params)
 
-        phase_reports.extend(self._dispatch_goal(build_phase1))
+        phase_reports.extend(self._dispatch_goal(build_phase1, target_robots=detected_robots))
         if any((not r.success) for r in phase_reports[-len(detected_robots):]):
-            self._render_reports(phase_reports)
-            return
+            if render_result:
+                self._render_reports(phase_reports)
+            return {"ok": False, "reason": "phase 1 failed", "reports": phase_reports}
 
         # Phase 2: first transit for all robots.
         def build_phase2(robot: str) -> ExecutePlaybook.Goal:
@@ -1376,10 +1732,11 @@ class TerminalOrchestrator(Node):
             )
             return _build_phase_goal(robot, "p2_transit", "transit", params)
 
-        phase_reports.extend(self._dispatch_goal(build_phase2))
+        phase_reports.extend(self._dispatch_goal(build_phase2, target_robots=detected_robots))
         if any((not r.success) for r in phase_reports[-len(detected_robots):]):
-            self._render_reports(phase_reports)
-            return
+            if render_result:
+                self._render_reports(phase_reports)
+            return {"ok": False, "reason": "phase 2 failed", "reports": phase_reports}
 
         # Phase 3: second rotate for all robots.
         def build_phase3(robot: str) -> ExecutePlaybook.Goal:
@@ -1389,10 +1746,11 @@ class TerminalOrchestrator(Node):
             )
             return _build_phase_goal(robot, "p3_rotate", "rotate", params)
 
-        phase_reports.extend(self._dispatch_goal(build_phase3))
+        phase_reports.extend(self._dispatch_goal(build_phase3, target_robots=detected_robots))
         if any((not r.success) for r in phase_reports[-len(detected_robots):]):
-            self._render_reports(phase_reports)
-            return
+            if render_result:
+                self._render_reports(phase_reports)
+            return {"ok": False, "reason": "phase 3 failed", "reports": phase_reports}
 
         # Phase 4: second transit for all robots.
         def build_phase4(robot: str) -> ExecutePlaybook.Goal:
@@ -1402,8 +1760,103 @@ class TerminalOrchestrator(Node):
             )
             return _build_phase_goal(robot, "p4_transit", "transit", params)
 
-        phase_reports.extend(self._dispatch_goal(build_phase4))
-        self._render_reports(phase_reports)
+        phase_reports.extend(self._dispatch_goal(build_phase4, target_robots=detected_robots))
+        if render_result:
+            self._render_reports(phase_reports)
+        return {"ok": True, "reason": "ok", "reports": phase_reports}
+
+    def _playbook_move_xy(self):
+        self._print_screen(
+            "PLAYBOOK: MOVE XY",
+            [
+                "detected-robot XY planner",
+                "x: forward(+) backward(-)",
+                "y: right(+) left(-)",
+                "main robot goes straight",
+                "others use 2-leg planner",
+                "",
+                "Type 'back' to cancel",
+            ],
+        )
+        # Requirement: this playbook targets ALL currently detected robots.
+        detected_robots = sorted(self._robots_map().keys())
+        if not detected_robots:
+            self._print_screen(
+                "MOVE XY REQUIREMENT",
+                [
+                    "No detected robots.",
+                    "Start robot bringup and retry.",
+                ],
+            )
+            self._pause()
+            return
+
+        x_m = self._prompt_float("x meters", default=1.0)
+        if x_m is None:
+            return
+        y_m = self._prompt_float("y meters", default=1.0)
+        if y_m is None:
+            return
+        speed = self._prompt_float("speed scale", default=self.default_speed_scale, allow_zero=False)
+        if speed is None:
+            return
+        speed = max(0.05, min(1.5, speed))
+        max_detour_m = self._prompt_float("MAX PATH OFFSET m", default=0.8, allow_zero=False)
+        if max_detour_m is None:
+            return
+        max_detour_m = max(0.05, float(max_detour_m))
+
+        self._print_screen(
+            "MAIN ROBOT SELECT",
+            [
+                "Choose main robot (anchor)",
+                "Formation offsets are",
+                "interpreted from this robot.",
+                "",
+            ] + [f"{i+1}) {r}" for i, r in enumerate(detected_robots)],
+        )
+        while True:
+            main_choice = input("Main robot index [1]: ").strip()
+            if main_choice == "":
+                main_idx = 1
+                break
+            if main_choice.lower() in ("b", "back", "q", "quit"):
+                return
+            try:
+                parsed = int(main_choice)
+            except ValueError:
+                print("Invalid index. Enter a number from the list.")
+                continue
+            if 1 <= parsed <= len(detected_robots):
+                main_idx = parsed
+                break
+            print(f"Invalid index. Choose 1..{len(detected_robots)}.")
+        main_robot = detected_robots[main_idx - 1]
+
+        default_rel = self._default_relative_robot_config(
+            detected_robots=detected_robots,
+            main_robot=main_robot,
+            default_spacing_m=0.45,
+        )
+        rel_cfg = self._prompt_relative_robot_config(
+            detected_robots=detected_robots,
+            main_robot=main_robot,
+            defaults=default_rel,
+        )
+        if rel_cfg is None:
+            return
+
+        self._run_move_xy_with_params(
+            detected_robots=detected_robots,
+            x_m=float(x_m),
+            y_m=float(y_m),
+            speed=float(speed),
+            max_detour_m=float(max_detour_m),
+            main_robot=main_robot,
+            rel_cfg=rel_cfg,
+            require_confirm=True,
+            render_result=True,
+        )
 
     def _playbook_execute_all_commands(self):
         """
@@ -1657,6 +2110,8 @@ class TerminalOrchestrator(Node):
             "3) Transit distance",
             "4) Rotate degrees",
             "",
+            "s) Playbook sequence",
+            "",
             "t) Select target",
             "r) Refresh",
             "q) Quit",
@@ -1684,6 +2139,9 @@ class TerminalOrchestrator(Node):
                 continue
             if choice == "t":
                 self._target_menu()
+                continue
+            if choice == "s":
+                self._playbook_sequence_menu()
                 continue
             if choice == "1":
                 self._playbook_move_xy()
