@@ -213,7 +213,8 @@ wait
 What it does:
 - Sends the same objective-point command to each robot (`north_m`, `east_m`).
 - Robot-specific motion strategy is selected robot-side from drive/hardware profile.
-- Mecanum robots execute objective movement as: forward/backward leg first, then strafe leg.
+- Current field strategy executes axis legs using forward+rotate behavior (no strafe dependency):
+  first leg, then ~90 deg rotate, then second leg.
 
 Notes:
 - `east_m > 0` means objective is to robot-right.
@@ -244,4 +245,119 @@ On a robot terminal:
 
 ```bash
 tail -f /tmp/robot_"${USER}"_audit.jsonl
+```
+
+## 6) Interpreting `terminal_orchestrator` JSON output
+
+After you confirm `EXECUTE? y/n`, `terminal_orchestrator` prints structured JSON events.
+These are intended to be copy/paste friendly for future Fleet Orchestrator integration work.
+
+Event types you will see:
+- `type: "playbook_command"`: dispatch intent per robot (task-style event).
+- `type: "audit_event"`: execution outcome per robot (result-style event).
+
+### A) Task-style dispatch event (`playbook_command`)
+
+Use this to verify command mapping before execution:
+- `intent_id`: unique command instance ID.
+- `command_id`: primitive being sent (`transit`, `rotate`, `transit_xy`, ...).
+- `targets`: robot receiving the command.
+- `parameters`: normalized command values sent to robot executor.
+- `preview.strategy_id`: strategy selected for that robot type.
+- `preview.steps`: ordered movement phases (direction + duration).
+
+Example:
+
+```json
+{
+  "command_id": "transit_xy",
+  "intent_id": "term_xy_robot2_1770000000",
+  "parameters": {
+    "east_m": 0.5,
+    "north_m": 0.2,
+    "speed": 1.0
+  },
+  "platform": {
+    "adapter_type": "terminal_orchestrator",
+    "platform_family": "robot_legion_teleop_python"
+  },
+  "preview": {
+    "cardinal_mode": "relative_fallback",
+    "drive_type": "mecanum_drive",
+    "hardware": "dual_tb6612_mecanum",
+    "notes": [
+      "north/east uses robot body frame without heading sensor",
+      "robots with different starting headings diverge in world frame"
+    ],
+    "profile_name": "mecanum_drive",
+    "profile_source": "registry",
+    "robot": "robot2",
+    "steps": [
+      {
+        "duration_s": 0.5,
+        "index": 1,
+        "motion": "forward",
+        "status_text": "omni forward leg 0.20m"
+      },
+      {
+        "duration_s": 0.785,
+        "index": 2,
+        "motion": "rotate_right",
+        "status_text": "omni rotate to lateral leg"
+      },
+      {
+        "duration_s": 1.25,
+        "index": 3,
+        "motion": "forward",
+        "status_text": "omni lateral leg right=0.50m"
+      }
+    ],
+    "strategy_id": "omni_axis_turn_xy"
+  },
+  "targets": "robot2",
+  "trace": {
+    "confidence": 1.0,
+    "explanation": "manual terminal playbook dispatch",
+    "translator": "terminal_orchestrator"
+  },
+  "type": "playbook_command"
+}
+```
+
+### B) Audit-style result event (`audit_event`)
+
+Use this to verify execution completion:
+- `status`: `succeeded` or `failed`.
+- `accepted`: whether the robot action server accepted execution.
+- `reason`: robot-side result reason string.
+- `intent_id`: links result back to the original dispatch event.
+
+Example:
+
+```json
+{
+  "accepted": true,
+  "intent_id": "term_xy_robot2_1770000000",
+  "reason": "ok (omni_axis_turn_xy)",
+  "robot": "robot2",
+  "stage": "execute_playbook_dispatch",
+  "status": "succeeded",
+  "type": "audit_event"
+}
+```
+
+### C) Optional topic publishing mode
+
+By default, JSON is printed to terminal only.
+To also publish JSON to Fleet-Orchestrator-style topics:
+
+```bash
+ros2 run robot_legion_teleop_python terminal_orchestrator --ros-args -p publish_fleet_topics:=true
+```
+
+Then monitor:
+
+```bash
+ros2 topic echo /fo/task
+ros2 topic echo /fo/audit
 ```
