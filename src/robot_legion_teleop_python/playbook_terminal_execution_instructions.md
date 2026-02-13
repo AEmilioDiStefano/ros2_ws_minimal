@@ -105,6 +105,13 @@ You should see:
 - `Detected robots: <N>`
 - robot list under `Robots:`
 
+Detection behavior:
+- `Detected robots` now means **reachable** robots, not just graph-discovered names.
+- `terminal_orchestrator` probes each discovered `/<robot>/execute_playbook`
+  action server with a short timeout and only lists responders.
+- Probe timeout parameter:
+  - `reachable_probe_timeout_s` (default `0.15`)
+
 UI controls:
 - `t` choose target robots (`all` or one robot)
 - `1` Detected-robot XY planner (deterministic linear algebra)
@@ -445,6 +452,10 @@ Important variables (playbook `1` and dispatch):
   - `distance_m` from main robot
   - `clock` direction relative to main robot (`12` forward, `3` right, `6` back, `9` left)
   - `heading_clock` direction relative to main robot (`12` means same direction)
+- per-robot duration calibration (in `robot_profiles.yaml`, `robots.<name>.params.drive`):
+  - `orchestrator_linear_duration_scale`
+  - `orchestrator_angular_duration_scale`
+  - terminal_orchestrator applies these per robot when converting meters/degrees to duration.
 - side selection mode for non-main robots:
   - `auto_dy_sign_with_fallback` (preferred side from `dy`, fallback to opposite side if needed)
 - final heading mode:

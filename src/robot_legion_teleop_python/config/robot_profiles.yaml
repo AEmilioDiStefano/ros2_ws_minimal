@@ -58,10 +58,22 @@ robots:
   robot2:
     drive_profile: mecanum_drive
     hardware_profile: dual_tb6612_mecanum
+    params:
+      drive:
+        # Field calibration:
+        # commanded 1.00 m -> observed 0.90 m, so duration scale = 1/0.9
+        orchestrator_linear_duration_scale: 1.111111
 
   robot3:
     drive_profile: diff_drive
     hardware_profile: L298N_diff
+    params:
+      drive:
+        # Field calibration:
+        # commanded 1.00 m -> observed 0.90 m
+        orchestrator_linear_duration_scale: 1.111111
+        # commanded 90 deg -> observed 45 deg, so duration scale = 2.0
+        orchestrator_angular_duration_scale: 2.0
 
   # Omni robot (TB6612 x2)
   robot_omni:

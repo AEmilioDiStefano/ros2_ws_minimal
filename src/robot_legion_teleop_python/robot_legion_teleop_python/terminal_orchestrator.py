@@ -68,17 +68,26 @@ class TerminalOrchestrator(Node):
         self.declare_parameter("base_strafe_mps", 0.35)
         self.declare_parameter("base_angular_rps", 2.00)
         self.declare_parameter("default_speed_scale", 1.0)
+        # Duration calibration scales for meter/degree playbooks.
+        # final_duration = ideal_duration * scale
+        self.declare_parameter("linear_duration_scale", 1.0)
+        self.declare_parameter("angular_duration_scale", 1.0)
         # If dispatch waits longer than this, that robot is skipped for the phase.
         # Requested behavior: explicit 1 second skip threshold.
         self.declare_parameter("dispatch_timeout_s", 1.0)
         self.declare_parameter("send_goal_response_timeout_s", 1.0)
+        # Reachability probe used for menu listing so stale graph entries are hidden.
+        self.declare_parameter("reachable_probe_timeout_s", 0.15)
 
         self.base_linear_mps = float(self.get_parameter("base_linear_mps").value)
         self.base_strafe_mps = float(self.get_parameter("base_strafe_mps").value)
         self.base_angular_rps = float(self.get_parameter("base_angular_rps").value)
         self.default_speed_scale = float(self.get_parameter("default_speed_scale").value)
+        self.linear_duration_scale = float(self.get_parameter("linear_duration_scale").value)
+        self.angular_duration_scale = float(self.get_parameter("angular_duration_scale").value)
         self.dispatch_timeout_s = float(self.get_parameter("dispatch_timeout_s").value)
         self.send_goal_response_timeout_s = float(self.get_parameter("send_goal_response_timeout_s").value)
+        self.reachable_probe_timeout_s = float(self.get_parameter("reachable_probe_timeout_s").value)
 
         # Do not use name "_clients": rclpy.Node already uses that internally.
         self._action_clients: Dict[str, ActionClient] = {}
@@ -281,24 +290,65 @@ class TerminalOrchestrator(Node):
 
     # ---------------- Coordinated XY linear algebra planner ----------------
 
-    def _rotation_params_from_delta(self, delta_rad: float, speed_scale: float) -> Dict[str, object]:
+    def _duration_scales_for_robot(self, robot: Optional[str]) -> Tuple[float, float]:
+        """
+        Resolve per-robot duration calibration scales.
+
+        Order of precedence:
+        1) robot_profiles.yaml per-robot drive params:
+           - orchestrator_linear_duration_scale
+           - orchestrator_angular_duration_scale
+        2) node parameters:
+           - linear_duration_scale
+           - angular_duration_scale
+        """
+        linear_scale = float(self.linear_duration_scale)
+        angular_scale = float(self.angular_duration_scale)
+        if not robot or not self._profile_registry:
+            return (
+                max(0.1, min(5.0, linear_scale)),
+                max(0.1, min(5.0, angular_scale)),
+            )
+        try:
+            prof = resolve_robot_profile(self._profile_registry, robot)
+            dp = prof.get("drive_params", {}) or {}
+            linear_scale = float(dp.get("orchestrator_linear_duration_scale", linear_scale))
+            angular_scale = float(dp.get("orchestrator_angular_duration_scale", angular_scale))
+        except Exception:
+            pass
+        return (
+            max(0.1, min(5.0, linear_scale)),
+            max(0.1, min(5.0, angular_scale)),
+        )
+
+    def _rotation_params_from_delta(
+        self, delta_rad: float, speed_scale: float, robot: Optional[str] = None
+    ) -> Dict[str, object]:
         """
         Convert a signed rotation delta into executor rotate params.
         """
         direction = "left" if delta_rad >= 0.0 else "right"
-        duration_s = abs(delta_rad) / max(1e-6, self.base_angular_rps * speed_scale)
+        _, angular_scale = self._duration_scales_for_robot(robot)
+        duration_s = (
+            abs(delta_rad) / max(1e-6, self.base_angular_rps * speed_scale)
+        ) * angular_scale
         return {
             "direction": direction,
             "duration_s": duration_s,
             "speed": speed_scale,
         }
 
-    def _transit_params_from_length(self, length_m: float, speed_scale: float) -> Dict[str, object]:
+    def _transit_params_from_length(
+        self, length_m: float, speed_scale: float, robot: Optional[str] = None
+    ) -> Dict[str, object]:
         """
         Convert a signed path length into executor transit params.
         """
         direction = "forward" if length_m >= 0.0 else "backward"
-        duration_s = abs(length_m) / max(1e-6, self.base_linear_mps * speed_scale)
+        linear_scale, _ = self._duration_scales_for_robot(robot)
+        duration_s = (
+            abs(length_m) / max(1e-6, self.base_linear_mps * speed_scale)
+        ) * linear_scale
         return {
             "direction": direction,
             "duration_s": duration_s,
@@ -660,8 +710,35 @@ class TerminalOrchestrator(Node):
         pairs = sorted(found.items(), key=lambda p: p[0])
         return pairs
 
+    def _reachable_robots_map(self, probe_timeout_s: Optional[float] = None) -> Dict[str, str]:
+        """
+        Return only robots whose execute_playbook action server responds to a short probe.
+
+        This filters out stale DDS graph entries (for example after hard power-off)
+        so the menu shows reachable robots instead of merely discovered names.
+        """
+        discovered = {robot: action for robot, action in self._discover_action_servers()}
+        if not discovered:
+            return {}
+
+        timeout_s = (
+            self.reachable_probe_timeout_s
+            if probe_timeout_s is None
+            else max(0.0, float(probe_timeout_s))
+        )
+        reachable: Dict[str, str] = {}
+        for robot, action_name in discovered.items():
+            client = self._get_or_make_client(action_name)
+            try:
+                if client.wait_for_server(timeout_sec=timeout_s):
+                    reachable[robot] = action_name
+            except Exception:
+                # Any probe error is treated as not reachable right now.
+                continue
+        return reachable
+
     def _robots_map(self) -> Dict[str, str]:
-        return {robot: action for robot, action in self._discover_action_servers()}
+        return self._reachable_robots_map()
 
     def _get_or_make_client(self, action_name: str) -> ActionClient:
         client = self._action_clients.get(action_name)
@@ -1281,7 +1358,9 @@ class TerminalOrchestrator(Node):
         # Phase 1: first rotate for all robots (parallel dispatch).
         def build_phase1(robot: str) -> ExecutePlaybook.Goal:
             p = plans[robot]
-            params = self._rotation_params_from_delta(delta_rad=p.theta1, speed_scale=speed)
+            params = self._rotation_params_from_delta(
+                delta_rad=p.theta1, speed_scale=speed, robot=robot
+            )
             return _build_phase_goal(robot, "p1_rotate", "rotate", params)
 
         phase_reports.extend(self._dispatch_goal(build_phase1))
@@ -1292,7 +1371,9 @@ class TerminalOrchestrator(Node):
         # Phase 2: first transit for all robots.
         def build_phase2(robot: str) -> ExecutePlaybook.Goal:
             p = plans[robot]
-            params = self._transit_params_from_length(length_m=p.length1_m, speed_scale=speed)
+            params = self._transit_params_from_length(
+                length_m=p.length1_m, speed_scale=speed, robot=robot
+            )
             return _build_phase_goal(robot, "p2_transit", "transit", params)
 
         phase_reports.extend(self._dispatch_goal(build_phase2))
@@ -1303,7 +1384,9 @@ class TerminalOrchestrator(Node):
         # Phase 3: second rotate for all robots.
         def build_phase3(robot: str) -> ExecutePlaybook.Goal:
             p = plans[robot]
-            params = self._rotation_params_from_delta(delta_rad=(p.theta2 - p.theta1), speed_scale=speed)
+            params = self._rotation_params_from_delta(
+                delta_rad=(p.theta2 - p.theta1), speed_scale=speed, robot=robot
+            )
             return _build_phase_goal(robot, "p3_rotate", "rotate", params)
 
         phase_reports.extend(self._dispatch_goal(build_phase3))
@@ -1314,7 +1397,9 @@ class TerminalOrchestrator(Node):
         # Phase 4: second transit for all robots.
         def build_phase4(robot: str) -> ExecutePlaybook.Goal:
             p = plans[robot]
-            params = self._transit_params_from_length(length_m=p.length2_m, speed_scale=speed)
+            params = self._transit_params_from_length(
+                length_m=p.length2_m, speed_scale=speed, robot=robot
+            )
             return _build_phase_goal(robot, "p4_transit", "transit", params)
 
         phase_reports.extend(self._dispatch_goal(build_phase4))
@@ -1433,14 +1518,30 @@ class TerminalOrchestrator(Node):
         speed = max(0.05, min(1.5, speed))
 
         direction = "forward" if meters >= 0.0 else "backward"
-        duration_s = abs(meters) / max(1e-6, self.base_linear_mps * speed)
         target_text = self.selected_robot or "ALL"
+        if self.selected_robot:
+            linear_scale, _ = self._duration_scales_for_robot(self.selected_robot)
+            duration_s = (
+                abs(meters) / max(1e-6, self.base_linear_mps * speed)
+            ) * linear_scale
+        else:
+            duration_s = abs(meters) / max(1e-6, self.base_linear_mps * speed)
         summary = [
             f"Target: {target_text}",
             "",
             f"Distance: {meters:.2f} m",
             f"Direction: {direction}",
-            f"Duration: {duration_s:.2f} s",
+            (
+                f"Duration: {duration_s:.2f} s"
+                if self.selected_robot
+                else f"Base duration: {duration_s:.2f} s"
+            ),
+            (
+                "Per-robot linear calibration "
+                "applied at dispatch"
+                if not self.selected_robot
+                else ""
+            ),
         ]
         if not self._confirm(summary):
             return
@@ -1452,9 +1553,13 @@ class TerminalOrchestrator(Node):
             g.intent_id = f"term_transit_{robot}_{now}"
             g.command_id = "transit"
             g.vehicle_ids = [robot]
+            linear_scale, _ = self._duration_scales_for_robot(robot)
+            robot_duration_s = (
+                abs(meters) / max(1e-6, self.base_linear_mps * speed)
+            ) * linear_scale
             params = {
                 "direction": direction,
-                "duration_s": float(duration_s),
+                "duration_s": float(robot_duration_s),
                 "speed": float(speed),
             }
             g.parameters_json = json.dumps(params, separators=(",", ":"))
@@ -1484,14 +1589,30 @@ class TerminalOrchestrator(Node):
 
         direction = "left" if degrees >= 0.0 else "right"
         radians = abs(degrees) * 3.141592653589793 / 180.0
-        duration_s = radians / max(1e-6, self.base_angular_rps * speed)
         target_text = self.selected_robot or "ALL"
+        if self.selected_robot:
+            _, angular_scale = self._duration_scales_for_robot(self.selected_robot)
+            duration_s = (
+                radians / max(1e-6, self.base_angular_rps * speed)
+            ) * angular_scale
+        else:
+            duration_s = radians / max(1e-6, self.base_angular_rps * speed)
         summary = [
             f"Target: {target_text}",
             "",
             f"Rotate: {degrees:.2f} deg",
             f"Direction: {direction}",
-            f"Duration: {duration_s:.2f} s",
+            (
+                f"Duration: {duration_s:.2f} s"
+                if self.selected_robot
+                else f"Base duration: {duration_s:.2f} s"
+            ),
+            (
+                "Per-robot angular calibration "
+                "applied at dispatch"
+                if not self.selected_robot
+                else ""
+            ),
         ]
         if not self._confirm(summary):
             return
@@ -1503,9 +1624,13 @@ class TerminalOrchestrator(Node):
             g.intent_id = f"term_rotate_{robot}_{now}"
             g.command_id = "rotate"
             g.vehicle_ids = [robot]
+            _, angular_scale = self._duration_scales_for_robot(robot)
+            robot_duration_s = (
+                radians / max(1e-6, self.base_angular_rps * speed)
+            ) * angular_scale
             params = {
                 "direction": direction,
-                "duration_s": float(duration_s),
+                "duration_s": float(robot_duration_s),
                 "speed": float(speed),
             }
             g.parameters_json = json.dumps(params, separators=(",", ":"))
