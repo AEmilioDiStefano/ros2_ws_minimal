@@ -1013,12 +1013,17 @@ class TerminalOrchestrator(Node):
         main_goal = goal_vectors.get(main_robot, (float(x_m), float(y_m)))
         ref_line = main_goal if math.hypot(main_goal[0], main_goal[1]) > 1e-9 else (1.0, 0.0)
 
-        # Auto side assignment tree for non-main robots:
-        # left, right, left, right, ... in detected order.
+        # Side preference for non-main robots:
+        # 1) Prefer side from dy sign so forward+forward constraints stay feasible.
+        #    +y (rightward destination) prefers left-turn geometry,
+        #    -y (leftward destination) prefers right-turn geometry.
+        # 2) If dy is near zero, use alternating order to maintain separation.
+        # 3) If preferred side fails, automatically retry opposite side.
         side_for_robot: Dict[str, str] = {}
         non_main_order = [r for r in detected_robots if r != main_robot]
+        alt_side_hint: Dict[str, str] = {}
         for i, robot in enumerate(non_main_order):
-            side_for_robot[robot] = "left" if (i % 2 == 0) else "right"
+            alt_side_hint[robot] = "left" if (i % 2 == 0) else "right"
 
         # Base heading magnitude uses the main goal direction.
         base_heading = math.atan2(float(main_goal[1]), float(main_goal[0])) if (abs(main_goal[0]) + abs(main_goal[1])) > 1e-9 else 0.0
@@ -1055,18 +1060,44 @@ class TerminalOrchestrator(Node):
                     max_detour_m=abs(self._signed_distance_to_line((dx, dy), ref_line)),
                 )
             else:
-                plan = self._plan_two_leg_deterministic(
-                    dx=dx,
-                    dy=dy,
-                    turn_side=side_for_robot.get(robot, "left"),
-                    max_detour_m=max_detour_m,
-                    theta2_fixed=(+theta2_abs if side_for_robot.get(robot, "left") == "left" else -theta2_abs),
-                    target_max_detour_m=float(detour_targets.get(robot, 0.0)),
-                    ref_line_dir_xy=ref_line,
-                )
+                if dy > 1e-6:
+                    preferred_side = "left"
+                elif dy < -1e-6:
+                    preferred_side = "right"
+                else:
+                    preferred_side = alt_side_hint.get(robot, "left")
+                fallback_side = "right" if preferred_side == "left" else "left"
+                candidate_sides = [preferred_side, fallback_side]
+
+                best_plan: Optional[TwoLegPlan] = None
+                best_side: Optional[str] = None
+                best_score: Optional[Tuple[float, float]] = None
+                for side in candidate_sides:
+                    candidate = self._plan_two_leg_deterministic(
+                        dx=dx,
+                        dy=dy,
+                        turn_side=side,
+                        max_detour_m=max_detour_m,
+                        theta2_fixed=(+theta2_abs if side == "left" else -theta2_abs),
+                        target_max_detour_m=float(detour_targets.get(robot, 0.0)),
+                        ref_line_dir_xy=ref_line,
+                    )
+                    if candidate is None:
+                        continue
+                    score = (
+                        abs(candidate.max_detour_m - float(detour_targets.get(robot, 0.0))),
+                        candidate.length1_m + candidate.length2_m,
+                    )
+                    if best_score is None or score < best_score:
+                        best_plan = candidate
+                        best_side = side
+                        best_score = score
+
+                plan = best_plan
                 if plan is None:
                     failures.append(robot)
                 else:
+                    side_for_robot[robot] = best_side or preferred_side
                     plans[robot] = plan
 
         if failures:
@@ -1103,7 +1134,7 @@ class TerminalOrchestrator(Node):
             "Relative config: custom/default",
             "(distance + clock per robot)",
             "Side assignment: auto",
-            "(left,right,left,...)",
+            "(dy-sign preferred, fallback)",
             f"MAX PATH OFFSET={max_detour_m:.2f} m",
             "",
             f"Est phase total: {est_total_seq:.2f} s",
@@ -1162,7 +1193,7 @@ class TerminalOrchestrator(Node):
                     "y_m": y_m,
                     "speed": speed,
                     "relative_robot_config": rel_cfg,
-                    "side_assignment_mode": "auto_alternating_left_right",
+                    "side_assignment_mode": "auto_dy_sign_with_fallback",
                     "max_path_offset_m": max_detour_m,
                     "main_robot": main_robot,
                     "secondary_robot": secondary_robot,

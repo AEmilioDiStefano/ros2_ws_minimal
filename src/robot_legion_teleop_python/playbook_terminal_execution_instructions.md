@@ -389,8 +389,11 @@ What it does:
 3. Uses deterministic linear algebra to compute trajectories:
    - main robot: one rotation + one forward/back movement (straight path to its objective)
    - other robots: two rotations + two forward/back movements
-   - non-main turn side is assigned automatically by detected order:
-     left, right, left, right, ...
+   - non-main turn side is auto-selected from destination geometry:
+     - if `dy > 0` (target to robot-right), planner prefers `left` side
+     - if `dy < 0` (target to robot-left), planner prefers `right` side
+     - if `dy ~= 0`, planner uses alternating hint (`left,right,left,...`)
+     - if preferred side is infeasible, planner retries opposite side automatically
 4. Enforces detour policy from the main robot straight path:
    - main robot detour target = `0`
    - second robot (next detected after main) detour target = `MAX PATH OFFSET`
@@ -427,6 +430,8 @@ Important variables (playbook `1` and dispatch):
 - per-robot relative inputs (optional override):
   - `distance_m` from main robot
   - `clock` direction relative to main robot (`12` forward, `3` right, `6` back, `9` left)
+- side selection mode for non-main robots:
+  - `auto_dy_sign_with_fallback` (preferred side from `dy`, fallback to opposite side if needed)
 - `dispatch_timeout_s` (node param, default `1.0`): wait limit for action server availability before skipping robot.
 - `send_goal_response_timeout_s` (node param, default `1.0`): wait limit for goal-accept response before skipping robot.
 
