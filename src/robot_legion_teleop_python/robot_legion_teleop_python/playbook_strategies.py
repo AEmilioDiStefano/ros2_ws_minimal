@@ -41,7 +41,9 @@ def _is_mecanum(drive_type: str) -> bool:
 def _strategy_id_for(drive_type: str, hardware: str) -> str:
     hw = str(hardware or "").strip().lower()
     if _is_mecanum(drive_type):
-        return "omni_strafe_xy"
+        # Current field behavior: mecanum lateral motion can be unreliable,
+        # so we use rotate+forward axis stepping for predictable outcomes.
+        return "omni_axis_turn_xy"
     if "l298n" in hw:
         return "diff_axis_split_xy"
     if "tb6612" in hw:
@@ -95,13 +97,15 @@ def _resolve_body_displacement(
     return north_m, east_m
 
 
-def _plan_omni_xy(forward_m: float, right_m: float, v_fwd: float, v_strafe: float) -> List[TimedTwistPlan]:
+def _plan_omni_axis_turn(forward_m: float, right_m: float, v_fwd: float, w_rot: float) -> List[TimedTwistPlan]:
     if abs(forward_m) < 1e-9 and abs(right_m) < 1e-9:
         return [TimedTwistPlan(twist=Twist(), duration_s=0.0, status_text="already at target")]
     plans: List[TimedTwistPlan] = []
 
-    # Keep omni objective execution predictable in tight spaces:
-    # complete forward/backward leg first, then lateral leg.
+    # Execute objective in two axis-aligned legs:
+    #   1) forward/backward leg in current heading
+    #   2) rotate +/- 90 degrees and drive the right/left leg forward
+    # This avoids dependence on strafing behavior.
     if abs(forward_m) > 1e-9:
         plans.append(
             TimedTwistPlan(
@@ -112,13 +116,20 @@ def _plan_omni_xy(forward_m: float, right_m: float, v_fwd: float, v_strafe: floa
         )
 
     if abs(right_m) > 1e-9:
-        # Existing teleop/motor convention uses +linear.y as left.
-        strafe_vy = -abs(v_strafe) if right_m > 0.0 else +abs(v_strafe)
+        quarter_turn = math.pi / 2.0
+        to_right_sign = -1.0 if right_m > 0.0 else +1.0
         plans.append(
             TimedTwistPlan(
-                twist=_mk_twist(vx=0.0, vy=strafe_vy, wz=0.0),
-                duration_s=_duration(right_m, v_strafe),
-                status_text=f"omni strafe leg right={right_m:.2f}m",
+                twist=_mk_twist(vx=0.0, vy=0.0, wz=to_right_sign * abs(w_rot)),
+                duration_s=quarter_turn / max(1e-6, abs(w_rot)),
+                status_text="omni rotate to lateral leg",
+            )
+        )
+        plans.append(
+            TimedTwistPlan(
+                twist=_mk_twist(vx=abs(v_fwd), vy=0.0, wz=0.0),
+                duration_s=abs(right_m) / max(1e-6, abs(v_fwd)),
+                status_text=f"omni lateral leg right={right_m:.2f}m",
             )
         )
 
@@ -153,39 +164,14 @@ def _plan_diff_heading_then_transit(forward_m: float, right_m: float, v_fwd: flo
 
 def _plan_diff_axis_split(forward_m: float, right_m: float, v_fwd: float, w_rot: float) -> List[TimedTwistPlan]:
     """
-    Axis-split strategy:
-      1) complete right/left leg first
-      2) return heading to forward axis
-      3) complete forward/backward leg
+    Axis-split strategy (no heading restore):
+      1) complete forward/backward leg first
+      2) rotate +/- 90 deg toward lateral leg
+      3) complete right/left leg as forward motion
     """
     plans: List[TimedTwistPlan] = []
     if abs(forward_m) < 1e-9 and abs(right_m) < 1e-9:
         return [TimedTwistPlan(twist=Twist(), duration_s=0.0, status_text="already at target")]
-
-    quarter_turn = math.pi / 2.0
-    if abs(right_m) > 1e-9:
-        to_right_sign = -1.0 if right_m > 0.0 else +1.0
-        plans.append(
-            TimedTwistPlan(
-                twist=_mk_twist(wz=to_right_sign * abs(w_rot)),
-                duration_s=quarter_turn / max(1e-6, abs(w_rot)),
-                status_text="axis-split rotate to right/left leg",
-            )
-        )
-        plans.append(
-            TimedTwistPlan(
-                twist=_mk_twist(vx=abs(v_fwd)),
-                duration_s=abs(right_m) / max(1e-6, abs(v_fwd)),
-                status_text=f"axis-split lateral leg right={right_m:.2f}m",
-            )
-        )
-        plans.append(
-            TimedTwistPlan(
-                twist=_mk_twist(wz=-to_right_sign * abs(w_rot)),
-                duration_s=quarter_turn / max(1e-6, abs(w_rot)),
-                status_text="axis-split rotate back to forward axis",
-            )
-        )
 
     if abs(forward_m) > 1e-9:
         plans.append(
@@ -193,6 +179,24 @@ def _plan_diff_axis_split(forward_m: float, right_m: float, v_fwd: float, w_rot:
                 twist=_mk_twist(vx=abs(v_fwd) if forward_m > 0.0 else -abs(v_fwd)),
                 duration_s=abs(forward_m) / max(1e-6, abs(v_fwd)),
                 status_text=f"axis-split forward leg {forward_m:.2f}m",
+            )
+        )
+
+    if abs(right_m) > 1e-9:
+        quarter_turn = math.pi / 2.0
+        to_right_sign = -1.0 if right_m > 0.0 else +1.0
+        plans.append(
+            TimedTwistPlan(
+                twist=_mk_twist(wz=to_right_sign * abs(w_rot)),
+                duration_s=quarter_turn / max(1e-6, abs(w_rot)),
+                status_text="axis-split rotate to lateral leg",
+            )
+        )
+        plans.append(
+            TimedTwistPlan(
+                twist=_mk_twist(vx=abs(v_fwd)),
+                duration_s=abs(right_m) / max(1e-6, abs(v_fwd)),
+                status_text=f"axis-split lateral leg right={right_m:.2f}m",
             )
         )
     return plans
@@ -223,8 +227,8 @@ def compile_transit_xy_plans(
         heading_rad=heading_rad,
     )
     sid = _strategy_id_for(drive_type, hardware)
-    if sid == "omni_strafe_xy":
-        plans = _plan_omni_xy(forward_m, right_m, v_fwd, v_strafe)
+    if sid == "omni_axis_turn_xy":
+        plans = _plan_omni_axis_turn(forward_m, right_m, v_fwd, w_rot)
     elif sid == "diff_axis_split_xy":
         plans = _plan_diff_axis_split(forward_m, right_m, v_fwd, w_rot)
     else:

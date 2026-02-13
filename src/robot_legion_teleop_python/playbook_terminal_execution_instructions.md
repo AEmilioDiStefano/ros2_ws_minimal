@@ -107,9 +107,10 @@ You should see:
 
 UI controls:
 - `t` choose target robots (`all` or one robot)
-- `1` Move objective `(x, y)` using `transit_xy`
-- `2` Transit distance (meters -> duration estimate)
-- `3` Rotate degrees (degrees -> duration estimate)
+- `1` Coordinated 3-robot XY planner (randomized 2-leg linear algebra)
+- `2` Execute ALL commands (validation sweep)
+- `3` Transit distance (meters -> duration estimate)
+- `4` Rotate degrees (degrees -> duration estimate)
 - `r` refresh discovery
 - `q` quit
 
@@ -256,6 +257,11 @@ Event types you will see:
 - `type: "playbook_command"`: dispatch intent per robot (task-style event).
 - `type: "audit_event"`: execution outcome per robot (result-style event).
 
+For option `1` specifically, you will see:
+- one high-level planning event with `command_id: "transit_xy_randomized_formation"`
+- then per-phase dispatch events (`rotate`, `transit`, `rotate`, `transit`) for each robot
+- then per-phase `audit_event` results for each robot
+
 ### A) Task-style dispatch event (`playbook_command`)
 
 Use this to verify command mapping before execution:
@@ -361,3 +367,60 @@ Then monitor:
 ros2 topic echo /fo/task
 ros2 topic echo /fo/audit
 ```
+
+## 7) Coordinated 3-Robot XY mode (option `1`)
+
+`1) Move objective (x,y)` now runs a coordinated planner intended for three robots.
+
+What it does:
+1. Requires exactly 3 selected robots.
+2. Asks for:
+   - base objective (`x`, `y`)
+   - speed scale
+   - robot spacing (default `0.45 m`)
+   - formation direction in radians (relative to anchor robot)
+   - turn side (`left` or `right`) shared by all robots
+   - `MAX PATH OFFSET m` (default `0.8`)
+   - random seed (or auto)
+   - anchor robot index
+3. Uses linear algebra + randomized heading pairs to compute two forward legs per robot.
+   - A shared second heading is enforced so all robots finish facing the same direction.
+4. Executes in synchronized phases:
+   - phase 1: rotate
+   - phase 2: forward leg 1
+   - phase 3: rotate
+   - phase 4: forward leg 2
+
+### Linear algebra summary
+
+For each robot, the planner solves:
+
+```text
+l1 * [cos(theta1), sin(theta1)] + l2 * [cos(theta2), sin(theta2)] = [dx, dy]
+```
+
+Where:
+- `[dx, dy]` is that robot's destination vector in robot-relative frame.
+- `theta1`, `theta2` are randomized heading angles (same turn side for all robots).
+- `theta2` is shared across robots in a run (common final facing direction).
+- `l1`, `l2` are segment lengths solved from the 2x2 linear system.
+
+The planner rejects a sampled solution if:
+- matrix is singular,
+- any leg length is too small/non-forward,
+- detour from straight-line path exceeds `MAX PATH OFFSET m`.
+
+### Why random seed is included
+
+The random seed changes the sampled heading pairs, so trajectories vary while still
+respecting:
+- same turn-side constraint,
+- max detour bound,
+- exact endpoint solution of the linear system.
+
+Use a fixed seed to reproduce the same trajectory set later.
+
+### Important frame note
+
+All vectors are robot-relative unless heading/global mode is added later.
+So this mode is best used when robots are staged with aligned initial heading.

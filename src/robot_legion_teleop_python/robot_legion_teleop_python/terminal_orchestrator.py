@@ -14,6 +14,8 @@ Goals:
 from __future__ import annotations
 
 import json
+import math
+import random
 import re
 import sys
 import time
@@ -23,12 +25,17 @@ from typing import Dict, List, Optional, Tuple
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from std_msgs.msg import String
 
 from fleet_orchestrator_interfaces.action import ExecutePlaybook
+from .drive_profiles import load_profile_registry, resolve_robot_profile
+from .playbook_strategies import compile_transit_xy_plans
 
 
 ACTION_RE = re.compile(r"^/([^/]+)/execute_playbook$")
+ACTION_SEND_GOAL_SVC_RE = re.compile(r"^/([^/]+)/execute_playbook/_action/send_goal$")
 ACTION_TYPE = "fleet_orchestrator_interfaces/action/ExecutePlaybook"
+ACTION_SEND_GOAL_TYPE = "fleet_orchestrator_interfaces/action/ExecutePlaybook_SendGoal"
 UI_WIDTH = 31  # Match teleop's narrow terminal style.
 
 
@@ -38,6 +45,19 @@ class GoalReport:
     accepted: bool
     success: bool
     reason: str
+
+
+@dataclass
+class TwoLegPlan:
+    """
+    Two-segment robot-relative motion plan:
+      rotate(theta1) -> transit(length1) -> rotate(theta2-theta1) -> transit(length2)
+    """
+    theta1: float
+    theta2: float
+    length1_m: float
+    length2_m: float
+    max_detour_m: float
 
 
 class TerminalOrchestrator(Node):
@@ -55,10 +75,36 @@ class TerminalOrchestrator(Node):
         self.base_angular_rps = float(self.get_parameter("base_angular_rps").value)
         self.default_speed_scale = float(self.get_parameter("default_speed_scale").value)
 
-        self._clients: Dict[str, ActionClient] = {}
+        # Do not use name "_clients": rclpy.Node already uses that internally.
+        self._action_clients: Dict[str, ActionClient] = {}
         self.selected_robot: Optional[str] = None  # None => all robots
 
+        # Fleet-style JSON event emission for integration testing.
+        self.declare_parameter("publish_fleet_topics", False)
+        self.publish_fleet_topics = bool(self.get_parameter("publish_fleet_topics").value)
+        self.task_pub = self.create_publisher(String, "/fo/task", 10)
+        self.audit_pub = self.create_publisher(String, "/fo/audit", 10)
+
+        # Best-effort registry for robot type/hardware previews.
+        self.declare_parameter("profiles_path", "")
+        profiles_path = str(self.get_parameter("profiles_path").value).strip() or None
+        self._profile_registry = None
+        try:
+            self._profile_registry = load_profile_registry(profiles_path)
+        except Exception:
+            self._profile_registry = None
+
     # ---------------- UI helpers ----------------
+
+    def _warmup_discovery(self, timeout_sec: float = 1.0, spin_step_sec: float = 0.1):
+        """
+        Allow ROS graph discovery to populate before first menu render.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=float(spin_step_sec))
+            if self._discover_action_servers():
+                return
 
     def _clear(self):
         # ANSI clear + home cursor.
@@ -128,17 +174,285 @@ class TerminalOrchestrator(Node):
                 continue
             return val
 
+    def _emit_json_event(self, topic_type: str, payload: dict):
+        """
+        Emit fleet-style JSON to terminal and optionally to /fo/task or /fo/audit.
+        """
+        # Pretty JSON for copy/paste into future fleet_orchestrator integration work.
+        raw = json.dumps(payload, indent=2, sort_keys=True)
+        print(raw)
+        sys.stdout.flush()
+
+        if not self.publish_fleet_topics:
+            return
+
+        msg = String()
+        msg.data = raw
+        if topic_type == "task":
+            self.task_pub.publish(msg)
+        elif topic_type == "audit":
+            self.audit_pub.publish(msg)
+
+    def _resolve_robot_profile_preview(self, robot: str) -> Dict[str, str]:
+        out = {
+            "drive_type": "unknown",
+            "hardware": "unknown",
+            "profile_name": "",
+            "source": "none",
+        }
+        if not self._profile_registry:
+            return out
+        try:
+            prof = resolve_robot_profile(self._profile_registry, robot)
+            out["drive_type"] = str(prof.get("drive_type") or "unknown")
+            out["hardware"] = str(prof.get("hardware") or "unknown")
+            out["profile_name"] = str(prof.get("profile_name") or "")
+            out["source"] = "registry"
+        except Exception:
+            pass
+        return out
+
+    def _twist_step_text(self, tw) -> str:
+        vx = float(getattr(tw.linear, "x", 0.0))
+        vy = float(getattr(tw.linear, "y", 0.0))
+        wz = float(getattr(tw.angular, "z", 0.0))
+        if abs(wz) > 1e-6 and abs(vx) < 1e-6 and abs(vy) < 1e-6:
+            return "rotate_left" if wz > 0.0 else "rotate_right"
+        if abs(vx) > 1e-6 and abs(vy) < 1e-6 and abs(wz) < 1e-6:
+            return "forward" if vx > 0.0 else "backward"
+        if abs(vy) > 1e-6 and abs(vx) < 1e-6 and abs(wz) < 1e-6:
+            return "strafe_left" if vy > 0.0 else "strafe_right"
+        if abs(vx) < 1e-6 and abs(vy) < 1e-6 and abs(wz) < 1e-6:
+            return "hold"
+        return "mixed_motion"
+
+    def _build_motion_preview(self, robot: str, goal: ExecutePlaybook.Goal) -> Dict[str, object]:
+        profile = self._resolve_robot_profile_preview(robot)
+        preview: Dict[str, object] = {
+            "robot": robot,
+            "drive_type": profile["drive_type"],
+            "hardware": profile["hardware"],
+            "profile_name": profile["profile_name"],
+            "profile_source": profile["source"],
+            "cardinal_mode": "relative_fallback",
+            "strategy_id": "",
+            "steps": [],
+            "notes": [],
+        }
+        if goal.command_id != "transit_xy":
+            return preview
+
+        try:
+            params = json.loads(goal.parameters_json or "{}")
+        except Exception:
+            params = {}
+        speed_scale = max(0.05, min(1.5, float(params.get("speed", 1.0))))
+        compiled = compile_transit_xy_plans(
+            drive_type=str(profile["drive_type"]),
+            hardware=str(profile["hardware"]),
+            north_m=float(getattr(goal, "north_m", 0.0)),
+            east_m=float(getattr(goal, "east_m", 0.0)),
+            v_fwd=self.base_linear_mps * speed_scale,
+            v_strafe=self.base_strafe_mps * speed_scale,
+            w_rot=self.base_angular_rps * speed_scale,
+            cardinal_mode="relative_fallback",
+            heading_rad=None,
+        )
+        preview["strategy_id"] = compiled.strategy_id
+        preview["steps"] = [
+            {
+                "index": i,
+                "motion": self._twist_step_text(plan.twist),
+                "duration_s": round(float(plan.duration_s), 3),
+                "status_text": str(plan.status_text),
+            }
+            for i, plan in enumerate(compiled.plans, start=1)
+        ]
+        preview["notes"] = [
+            "north/east uses robot body frame without heading sensor",
+            "robots with different starting headings diverge in world frame",
+        ]
+        return preview
+
+    # ---------------- Coordinated XY linear algebra planner ----------------
+
+    def _rotation_params_from_delta(self, delta_rad: float, speed_scale: float) -> Dict[str, object]:
+        """
+        Convert a signed rotation delta into executor rotate params.
+        """
+        direction = "left" if delta_rad >= 0.0 else "right"
+        duration_s = abs(delta_rad) / max(1e-6, self.base_angular_rps * speed_scale)
+        return {
+            "direction": direction,
+            "duration_s": duration_s,
+            "speed": speed_scale,
+        }
+
+    def _transit_params_from_length(self, length_m: float, speed_scale: float) -> Dict[str, object]:
+        """
+        Convert a signed path length into executor transit params.
+        """
+        direction = "forward" if length_m >= 0.0 else "backward"
+        duration_s = abs(length_m) / max(1e-6, self.base_linear_mps * speed_scale)
+        return {
+            "direction": direction,
+            "duration_s": duration_s,
+            "speed": speed_scale,
+        }
+
+    def _line_detour_distance(self, waypoint: Tuple[float, float], goal_xy: Tuple[float, float]) -> float:
+        """
+        Max lateral deviation from the straight line start->goal is the perpendicular
+        distance from the intermediate waypoint to that line.
+        """
+        wx, wy = waypoint
+        gx, gy = goal_xy
+        norm = math.hypot(gx, gy)
+        if norm < 1e-9:
+            return 0.0
+        # 2D cross-product magnitude divided by |goal|.
+        return abs(wx * gy - wy * gx) / norm
+
+    def _solve_two_leg_lengths(self, dx: float, dy: float, theta1: float, theta2: float) -> Optional[Tuple[float, float]]:
+        """
+        Solve the 2x2 linear system:
+          l1*[cos(theta1), sin(theta1)] + l2*[cos(theta2), sin(theta2)] = [dx, dy]
+
+        This is the core linear algebra step that transforms two heading choices into
+        two segment lengths that exactly reach the destination vector.
+        """
+        a11, a12 = math.cos(theta1), math.cos(theta2)
+        a21, a22 = math.sin(theta1), math.sin(theta2)
+        det = a11 * a22 - a12 * a21
+        if abs(det) < 1e-6:
+            return None
+        inv11, inv12 = a22 / det, -a12 / det
+        inv21, inv22 = -a21 / det, a11 / det
+        l1 = inv11 * dx + inv12 * dy
+        l2 = inv21 * dx + inv22 * dy
+        return (l1, l2)
+
+    def _plan_two_leg_randomized(
+        self,
+        dx: float,
+        dy: float,
+        turn_side: str,
+        max_detour_m: float,
+        rng: random.Random,
+        theta2_fixed: Optional[float] = None,
+        max_attempts: int = 250,
+    ) -> Optional[TwoLegPlan]:
+        """
+        Build a two-leg trajectory with randomized headings, constrained by:
+        - both pre-forward rotations are on the same side (all-left or all-right),
+        - max detour from straight path does not exceed max_detour_m.
+
+        Random numbers are injected in theta1/theta2 choices each attempt; the
+        first feasible solution is selected.
+        """
+        sign = +1.0 if turn_side == "left" else -1.0
+        target_heading = math.atan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-9 else 0.0
+
+        # Force both headings to remain on the requested side.
+        # We randomize within bounded windows to keep turns practical.
+        min_abs = math.radians(4.0)
+        max_abs = math.radians(70.0)
+        base_h = max(min_abs, min(max_abs, abs(target_heading) + math.radians(10.0)))
+        theta2_common = theta2_fixed
+        if theta2_common is not None:
+            # Ensure fixed heading respects selected side and range bounds.
+            theta2_common = sign * min(max_abs, max(min_abs, abs(theta2_common)))
+
+        for _ in range(max_attempts):
+            # Randomized heading pair (theta1 then theta2), same sign by construction.
+            # If theta2 is fixed globally, only theta1 is randomized (still distinct paths).
+            if theta2_common is not None:
+                theta2 = theta2_common
+                h2 = abs(theta2)
+                h1_max = max(min_abs + math.radians(3.0), h2 - math.radians(2.0))
+                if h1_max <= min_abs + 1e-6:
+                    continue
+                h1 = rng.uniform(min_abs, h1_max)
+                theta1 = sign * h1
+            else:
+                h1 = rng.uniform(min_abs, max(base_h * 0.75, min_abs + math.radians(3.0)))
+                h2 = rng.uniform(max(h1 + math.radians(3.0), min_abs), min(max_abs, h1 + math.radians(35.0)))
+                theta1 = sign * h1
+                theta2 = sign * h2
+
+            solved = self._solve_two_leg_lengths(dx, dy, theta1, theta2)
+            if solved is None:
+                continue
+            l1, l2 = solved
+
+            # Keep both forward legs non-trivial and forward to avoid backtracking.
+            if l1 <= 0.02 or l2 <= 0.02:
+                continue
+
+            # Intermediate waypoint after first segment.
+            wx = l1 * math.cos(theta1)
+            wy = l1 * math.sin(theta1)
+            detour = self._line_detour_distance((wx, wy), (dx, dy))
+            if detour > max_detour_m + 1e-9:
+                continue
+
+            return TwoLegPlan(
+                theta1=theta1,
+                theta2=theta2,
+                length1_m=l1,
+                length2_m=l2,
+                max_detour_m=detour,
+            )
+        return None
+
+    def _robot_goal_vectors_for_formation(
+        self,
+        robots: List[str],
+        anchor_robot: str,
+        x_m: float,
+        y_m: float,
+        spacing_m: float,
+        formation_dir_rad: float,
+    ) -> Dict[str, Tuple[float, float]]:
+        """
+        Compute per-robot destination vectors in anchor-relative formation terms.
+
+        Assumption (explicitly surfaced to user in UI/docs):
+        robots begin in a line referenced to anchor_robot with spacing spacing_m
+        and direction formation_dir_rad in the same body frame used by x/y.
+
+        Linear algebra simplification:
+        - Let v = [x, y] be anchor destination vector.
+        - Let s = spacing * [cos(phi), sin(phi)] be formation axis vector.
+        - Robot k (relative index from anchor) gets v + k*s.
+        """
+        ordered = list(robots)
+        if anchor_robot not in ordered:
+            return {r: (x_m, y_m) for r in ordered}
+
+        anchor_idx = ordered.index(anchor_robot)
+        sx = spacing_m * math.cos(formation_dir_rad)
+        sy = spacing_m * math.sin(formation_dir_rad)
+
+        out: Dict[str, Tuple[float, float]] = {}
+        for idx, robot in enumerate(ordered):
+            k = idx - anchor_idx
+            out[robot] = (x_m + k * sx, y_m + k * sy)
+        return out
+
     # ---------------- ROS discovery/action ----------------
 
     def _discover_action_servers(self) -> List[Tuple[str, str]]:
         """
         Returns list of (robot_name, action_name).
         """
-        pairs: List[Tuple[str, str]] = []
+        found: Dict[str, str] = {}
+
+        # Primary path: native action graph API.
         try:
             action_names_and_types = self.get_action_names_and_types()
         except Exception:
-            return pairs
+            action_names_and_types = []
 
         for action_name, types in action_names_and_types:
             if ACTION_TYPE not in types:
@@ -146,18 +460,36 @@ class TerminalOrchestrator(Node):
             m = ACTION_RE.match(action_name)
             if not m:
                 continue
-            pairs.append((m.group(1), action_name))
-        pairs.sort(key=lambda p: p[0])
+            found[m.group(1)] = action_name
+
+        # Fallback path: discover action servers via send_goal service endpoints.
+        # This is more robust on some DDS/graph combinations where action introspection
+        # lags while services are already visible.
+        if not found:
+            try:
+                services_and_types = self.get_service_names_and_types()
+            except Exception:
+                services_and_types = []
+            for service_name, types in services_and_types:
+                if ACTION_SEND_GOAL_TYPE not in types:
+                    continue
+                m = ACTION_SEND_GOAL_SVC_RE.match(service_name)
+                if not m:
+                    continue
+                robot = m.group(1)
+                found[robot] = f"/{robot}/execute_playbook"
+
+        pairs = sorted(found.items(), key=lambda p: p[0])
         return pairs
 
     def _robots_map(self) -> Dict[str, str]:
         return {robot: action for robot, action in self._discover_action_servers()}
 
     def _get_or_make_client(self, action_name: str) -> ActionClient:
-        client = self._clients.get(action_name)
+        client = self._action_clients.get(action_name)
         if client is None:
             client = ActionClient(self, ExecutePlaybook, action_name)
-            self._clients[action_name] = client
+            self._action_clients[action_name] = client
         return client
 
     def _send_goal(self, robot: str, action_name: str, goal: ExecutePlaybook.Goal) -> GoalReport:
@@ -199,13 +531,157 @@ class TerminalOrchestrator(Node):
             return []
         return [(r, a) for r, a in robots_map.items()]
 
+    def _spin_until(self, done_fn, timeout_sec: float, step_sec: float = 0.05) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while rclpy.ok():
+            if done_fn():
+                return True
+            now = time.monotonic()
+            if now >= deadline:
+                return done_fn()
+            rclpy.spin_once(self, timeout_sec=min(step_sec, deadline - now))
+        return done_fn()
+
     def _dispatch_goal(self, goal_factory) -> List[GoalReport]:
         robots_map = self._robots_map()
         targets = self._target_actions(robots_map)
         reports: List[GoalReport] = []
+
+        if not targets:
+            return reports
+
+        pending: Dict[str, Dict[str, object]] = {}
+
+        # Phase 1: send all goals first so robots can start at roughly the same time.
         for robot, action_name in targets:
+            client = self._get_or_make_client(action_name)
+            if not client.wait_for_server(timeout_sec=2.0):
+                reports.append(
+                    GoalReport(robot=robot, accepted=False, success=False, reason="server unavailable")
+                )
+                continue
             goal = goal_factory(robot)
-            reports.append(self._send_goal(robot, action_name, goal))
+            preview = self._build_motion_preview(robot, goal)
+            dispatch_task = {
+                "type": "playbook_command",
+                "intent_id": str(goal.intent_id),
+                "command_id": str(goal.command_id),
+                "platform": {
+                    "adapter_type": "terminal_orchestrator",
+                    "platform_family": "robot_legion_teleop_python",
+                },
+                "parameters": json.loads(goal.parameters_json or "{}") if goal.parameters_json else {},
+                "targets": robot,
+                "trace": {
+                    "translator": "terminal_orchestrator",
+                    "confidence": 1.0,
+                    "explanation": "manual terminal playbook dispatch",
+                },
+                "preview": preview,
+            }
+            self._emit_json_event("task", dispatch_task)
+            send_future = client.send_goal_async(goal)
+            pending[robot] = {"send_future": send_future, "intent_id": str(goal.intent_id)}
+
+        if not pending:
+            return reports
+
+        # Wait for send_goal responses.
+        self._spin_until(
+            lambda: all(state["send_future"].done() for state in pending.values()),
+            timeout_sec=5.0,
+        )
+
+        result_pending: Dict[str, Dict[str, object]] = {}
+        for robot, state in pending.items():
+            send_future = state["send_future"]
+            if not send_future.done():
+                reports.append(
+                    GoalReport(robot=robot, accepted=False, success=False, reason="goal send timeout")
+                )
+                continue
+
+            goal_handle = send_future.result()
+            if goal_handle is None:
+                reports.append(
+                    GoalReport(robot=robot, accepted=False, success=False, reason="no goal handle")
+                )
+                continue
+            if not goal_handle.accepted:
+                reports.append(
+                    GoalReport(robot=robot, accepted=False, success=False, reason="goal rejected")
+                )
+                continue
+
+            result_pending[robot] = {
+                "future": goal_handle.get_result_async(),
+                "intent_id": state.get("intent_id", ""),
+            }
+
+        if result_pending:
+            self._spin_until(
+                lambda: all(state["future"].done() for state in result_pending.values()),
+                timeout_sec=90.0,
+            )
+
+        for robot, state in result_pending.items():
+            result_future = state["future"]
+            intent_id = str(state.get("intent_id", ""))
+            if not result_future.done():
+                self._emit_json_event(
+                    "audit",
+                    {
+                        "type": "audit_event",
+                        "stage": "execute_playbook_dispatch",
+                        "intent_id": intent_id,
+                        "robot": robot,
+                        "status": "failed",
+                        "details": "result timeout",
+                    },
+                )
+                reports.append(
+                    GoalReport(robot=robot, accepted=True, success=False, reason="result timeout")
+                )
+                continue
+
+            wrapped = result_future.result()
+            result_msg = wrapped.result if wrapped is not None else None
+            if result_msg is None:
+                self._emit_json_event(
+                    "audit",
+                    {
+                        "type": "audit_event",
+                        "stage": "execute_playbook_dispatch",
+                        "intent_id": intent_id,
+                        "robot": robot,
+                        "status": "failed",
+                        "details": "empty result",
+                    },
+                )
+                reports.append(
+                    GoalReport(robot=robot, accepted=True, success=False, reason="empty result")
+                )
+                continue
+
+            success = bool(getattr(result_msg, "success", True))
+            reason = str(getattr(result_msg, "reason", "")).strip() or ("ok" if success else "failed")
+            accepted = bool(getattr(result_msg, "accepted", True))
+            self._emit_json_event(
+                "audit",
+                    {
+                        "type": "audit_event",
+                        "stage": "execute_playbook_dispatch",
+                        "intent_id": intent_id,
+                        "robot": robot,
+                        "status": "succeeded" if success else "failed",
+                    "accepted": accepted,
+                    "reason": reason,
+                },
+            )
+            reports.append(
+                GoalReport(robot=robot, accepted=accepted, success=success, reason=reason)
+            )
+
         return reports
 
     # ---------------- Menus ----------------
@@ -263,13 +739,32 @@ class TerminalOrchestrator(Node):
         self._print_screen(
             "PLAYBOOK: MOVE XY",
             [
-                "Move objective by x and y",
+                "3-robot coordinated XY",
                 "x: forward(+) backward(-)",
                 "y: right(+) left(-)",
+                "Two-leg randomized planner",
+                "(same turn side)",
                 "",
                 "Type 'back' to cancel",
             ],
         )
+        robots_map = self._robots_map()
+        targets = self._target_actions(robots_map)
+        target_robots = [r for r, _ in targets]
+        if len(target_robots) != 3:
+            self._print_screen(
+                "MOVE XY REQUIREMENT",
+                [
+                    "This playbook requires exactly",
+                    "3 target robots.",
+                    "",
+                    f"Current target count: {len(target_robots)}",
+                    "Use 't' to pick 3 robots.",
+                ],
+            )
+            self._pause()
+            return
+
         x_m = self._prompt_float("x meters", default=1.0)
         if x_m is None:
             return
@@ -281,37 +776,318 @@ class TerminalOrchestrator(Node):
             return
         speed = max(0.05, min(1.5, speed))
 
-        est_fx = abs(x_m) / max(1e-6, self.base_linear_mps * speed)
-        est_fy = abs(y_m) / max(1e-6, self.base_strafe_mps * speed)
-        est_total_seq = est_fx + est_fy
+        spacing_m = self._prompt_float("robot spacing m", default=0.45, allow_zero=False)
+        if spacing_m is None:
+            return
+        formation_dir_rad = self._prompt_float("formation dir rad", default=0.0)
+        if formation_dir_rad is None:
+            return
+        max_detour_m = self._prompt_float("MAX PATH OFFSET m", default=0.8, allow_zero=False)
+        if max_detour_m is None:
+            return
+        max_detour_m = max(0.05, float(max_detour_m))
+
+        turn_side_raw = input("turn side [left/right] [left]: ").strip().lower()
+        turn_side = turn_side_raw if turn_side_raw in ("left", "right") else "left"
+        seed_raw = input("random seed [auto]: ").strip()
+        seed = int(seed_raw) if seed_raw else int(time.time() * 1000) % 1_000_000_000
+        rng = random.Random(seed)
+        side_sign = +1.0 if turn_side == "left" else -1.0
+        base_heading = math.atan2(float(y_m), float(x_m)) if (abs(float(x_m)) + abs(float(y_m))) > 1e-9 else 0.0
+        # Shared terminal heading so all robots end facing the same direction.
+        theta2_common = side_sign * min(math.radians(60.0), max(math.radians(12.0), abs(base_heading) + math.radians(8.0)))
+
+        # Ask user to pick anchor robot for formation-relative offset model.
+        self._print_screen(
+            "ANCHOR SELECT",
+            [
+                "Choose first robot (anchor)",
+                "Formation offsets are",
+                "interpreted relative to this",
+                "robot using spacing + dir.",
+                "",
+            ] + [f"{i+1}) {r}" for i, r in enumerate(target_robots)],
+        )
+        anchor_choice = input("Anchor index [1]: ").strip()
+        anchor_idx = 1
+        if anchor_choice:
+            try:
+                anchor_idx = int(anchor_choice)
+            except ValueError:
+                anchor_idx = 1
+        anchor_idx = min(max(anchor_idx, 1), len(target_robots))
+        anchor_robot = target_robots[anchor_idx - 1]
+
+        goal_vectors = self._robot_goal_vectors_for_formation(
+            robots=target_robots,
+            anchor_robot=anchor_robot,
+            x_m=float(x_m),
+            y_m=float(y_m),
+            spacing_m=float(spacing_m),
+            formation_dir_rad=float(formation_dir_rad),
+        )
+
+        plans: Dict[str, TwoLegPlan] = {}
+        failures: List[str] = []
+        for robot in target_robots:
+            dx, dy = goal_vectors[robot]
+            plan = self._plan_two_leg_randomized(
+                dx=dx,
+                dy=dy,
+                turn_side=turn_side,
+                max_detour_m=max_detour_m,
+                rng=rng,
+                theta2_fixed=theta2_common,
+            )
+            if plan is None:
+                failures.append(robot)
+            else:
+                plans[robot] = plan
+
+        if failures:
+            self._print_screen(
+                "PLANNER FAILED",
+                [
+                    "No feasible randomized plan",
+                    "under current constraints for:",
+                    ", ".join(failures),
+                    "",
+                    "Try: larger MAX PATH OFFSET",
+                    "or different turn side/seed.",
+                ],
+            )
+            self._pause()
+            return
+
+        est_total_seq = 0.0
+        for robot in target_robots:
+            p = plans[robot]
+            r1 = abs(p.theta1) / max(1e-6, self.base_angular_rps * speed)
+            t1 = abs(p.length1_m) / max(1e-6, self.base_linear_mps * speed)
+            r2 = abs(p.theta2 - p.theta1) / max(1e-6, self.base_angular_rps * speed)
+            t2 = abs(p.length2_m) / max(1e-6, self.base_linear_mps * speed)
+            est_total_seq = max(est_total_seq, r1 + t1 + r2 + t2)
+
+        target_text = self.selected_robot or "ALL"
+        summary = [
+            f"Target: {target_text}",
+            "Mode: 3-robot coordinated XY",
+            "",
+            f"Anchor: {anchor_robot}",
+            f"Base x={x_m:.2f} y={y_m:.2f}",
+            f"Spacing={spacing_m:.2f} m",
+            f"Formation dir={formation_dir_rad:.3f} rad",
+            f"Turn side={turn_side}",
+            f"MAX PATH OFFSET={max_detour_m:.2f} m",
+            f"Seed={seed}",
+            "",
+            f"Est phase total: {est_total_seq:.2f} s",
+            "",
+            "Frame: robot-relative",
+            "(no heading alignment)",
+        ]
+
+        for robot in target_robots:
+            dx, dy = goal_vectors[robot]
+            p = plans[robot]
+            summary.append(f"{robot}: dx={dx:.2f} dy={dy:.2f}")
+            summary.append(
+                f"  th1={math.degrees(p.theta1):.1f}deg "
+                f"th2={math.degrees(p.theta2):.1f}deg "
+                f"detour={p.max_detour_m:.2f}m"
+            )
+
+        if not self._confirm(summary):
+            return
+
+        now = int(time.time())
+        phase_reports: List[GoalReport] = []
+
+        # Build phase helpers.
+        def _build_phase_goal(robot: str, phase_label: str, command_id: str, params: Dict[str, object]) -> ExecutePlaybook.Goal:
+            g = ExecutePlaybook.Goal()
+            g.intent_id = f"term_xy_{phase_label}_{robot}_{now}"
+            g.command_id = command_id
+            g.vehicle_ids = [robot]
+            g.parameters_json = json.dumps(params, separators=(",", ":"))
+            return g
+
+        # Emit a high-level planner event for future fleet_orchestrator integration.
+        self._emit_json_event(
+            "task",
+            {
+                "type": "playbook_command",
+                "intent_id": f"term_xy_plan_{now}",
+                "command_id": "transit_xy_randomized_formation",
+                "platform": {
+                    "adapter_type": "terminal_orchestrator",
+                    "platform_family": "robot_legion_teleop_python",
+                },
+                "targets": target_robots,
+                "parameters": {
+                    "x_m": x_m,
+                    "y_m": y_m,
+                    "speed": speed,
+                    "spacing_m": spacing_m,
+                    "formation_dir_rad": formation_dir_rad,
+                    "turn_side": turn_side,
+                    "max_path_offset_m": max_detour_m,
+                    "seed": seed,
+                    "anchor_robot": anchor_robot,
+                },
+                "trace": {
+                    "translator": "terminal_orchestrator",
+                    "confidence": 1.0,
+                    "explanation": "randomized two-leg linear algebra planner",
+                },
+                "plans": {
+                    robot: {
+                        "dx": goal_vectors[robot][0],
+                        "dy": goal_vectors[robot][1],
+                        "theta1_deg": math.degrees(plans[robot].theta1),
+                        "theta2_deg": math.degrees(plans[robot].theta2),
+                        "length1_m": plans[robot].length1_m,
+                        "length2_m": plans[robot].length2_m,
+                        "max_detour_m": plans[robot].max_detour_m,
+                    }
+                    for robot in target_robots
+                },
+            },
+        )
+
+        # Phase 1: first rotate for all robots (parallel dispatch).
+        def build_phase1(robot: str) -> ExecutePlaybook.Goal:
+            p = plans[robot]
+            params = self._rotation_params_from_delta(delta_rad=p.theta1, speed_scale=speed)
+            return _build_phase_goal(robot, "p1_rotate", "rotate", params)
+
+        phase_reports.extend(self._dispatch_goal(build_phase1))
+        if any((not r.success) for r in phase_reports[-len(target_robots):]):
+            self._render_reports(phase_reports)
+            return
+
+        # Phase 2: first transit for all robots.
+        def build_phase2(robot: str) -> ExecutePlaybook.Goal:
+            p = plans[robot]
+            params = self._transit_params_from_length(length_m=p.length1_m, speed_scale=speed)
+            return _build_phase_goal(robot, "p2_transit", "transit", params)
+
+        phase_reports.extend(self._dispatch_goal(build_phase2))
+        if any((not r.success) for r in phase_reports[-len(target_robots):]):
+            self._render_reports(phase_reports)
+            return
+
+        # Phase 3: second rotate for all robots.
+        def build_phase3(robot: str) -> ExecutePlaybook.Goal:
+            p = plans[robot]
+            params = self._rotation_params_from_delta(delta_rad=(p.theta2 - p.theta1), speed_scale=speed)
+            return _build_phase_goal(robot, "p3_rotate", "rotate", params)
+
+        phase_reports.extend(self._dispatch_goal(build_phase3))
+        if any((not r.success) for r in phase_reports[-len(target_robots):]):
+            self._render_reports(phase_reports)
+            return
+
+        # Phase 4: second transit for all robots.
+        def build_phase4(robot: str) -> ExecutePlaybook.Goal:
+            p = plans[robot]
+            params = self._transit_params_from_length(length_m=p.length2_m, speed_scale=speed)
+            return _build_phase_goal(robot, "p4_transit", "transit", params)
+
+        phase_reports.extend(self._dispatch_goal(build_phase4))
+        self._render_reports(phase_reports)
+
+    def _playbook_execute_all_commands(self):
+        """
+        Validation sweep:
+        Execute one safe example of each supported playbook primitive on all target robots.
+        This is intended as a quick integration test, not mission behavior.
+        """
+        self._print_screen(
+            "PLAYBOOK: ALL COMMANDS",
+            [
+                "Runs all primitive commands",
+                "on selected target robots.",
+                "",
+                "Type 'back' to cancel",
+            ],
+        )
+
+        speed = self._prompt_float("speed scale", default=0.8, allow_zero=False)
+        if speed is None:
+            return
+        speed = max(0.05, min(1.5, speed))
+
         target_text = self.selected_robot or "ALL"
         summary = [
             f"Target: {target_text}",
             "",
-            f"{x_m:.2f} m in x dir",
-            f"{y_m:.2f} m in right dir",
+            "Command sweep order:",
+            "1) hold",
+            "2) transit",
+            "3) rotate",
+            "4) strafe",
+            "5) diagonal",
+            "6) turn",
+            "7) transit_xy",
             "",
-            f"Est fwd: {est_fx:.2f} s",
-            f"Est strafe: {est_fy:.2f} s",
-            f"Est total: {est_total_seq:.2f} s",
+            f"Speed scale: {speed:.2f}",
+            "Purpose: playbook smoke test",
         ]
         if not self._confirm(summary):
             return
 
         now = int(time.time())
+        reports: List[GoalReport] = []
 
-        def build_goal(robot: str) -> ExecutePlaybook.Goal:
-            g = ExecutePlaybook.Goal()
-            g.intent_id = f"term_xy_{robot}_{now}"
-            g.command_id = "transit_xy"
-            g.vehicle_ids = [robot]
-            g.north_m = float(x_m)
-            g.east_m = float(y_m)
-            params = {"north_m": float(x_m), "east_m": float(y_m), "speed": float(speed)}
-            g.parameters_json = json.dumps(params, separators=(",", ":"))
-            return g
+        # Fixed safe-ish parameter set for deterministic testing.
+        command_plan = [
+            ("hold", {"duration_s": 0.5, "speed": speed}),
+            ("transit", {"direction": "forward", "duration_s": 0.8, "speed": speed}),
+            ("rotate", {"direction": "left", "duration_s": 0.5, "speed": speed}),
+            ("strafe", {"direction": "right", "duration_s": 0.7, "speed": speed}),
+            ("diagonal", {"direction": "fwd_right", "duration_s": 0.7, "speed": speed}),
+            ("turn", {"direction": "left", "duration_s": 0.7, "speed": speed}),
+            ("transit_xy", {"north_m": 0.25, "east_m": 0.15, "speed": speed}),
+        ]
 
-        reports = self._dispatch_goal(build_goal)
+        self._emit_json_event(
+            "task",
+            {
+                "type": "playbook_command",
+                "intent_id": f"term_all_commands_plan_{now}",
+                "command_id": "playbook_command_sweep",
+                "platform": {
+                    "adapter_type": "terminal_orchestrator",
+                    "platform_family": "robot_legion_teleop_python",
+                },
+                "targets": target_text,
+                "parameters": {"speed": speed, "command_count": len(command_plan)},
+                "trace": {
+                    "translator": "terminal_orchestrator",
+                    "confidence": 1.0,
+                    "explanation": "manual all-commands validation sweep",
+                },
+            },
+        )
+
+        for idx, (command_id, params) in enumerate(command_plan, start=1):
+            phase = f"c{idx}_{command_id}"
+
+            def build_goal(robot: str, cid=command_id, p=params, ph=phase) -> ExecutePlaybook.Goal:
+                g = ExecutePlaybook.Goal()
+                g.intent_id = f"term_all_{ph}_{robot}_{now}"
+                g.command_id = cid
+                g.vehicle_ids = [robot]
+                if cid == "transit_xy":
+                    g.north_m = float(p.get("north_m", 0.0))
+                    g.east_m = float(p.get("east_m", 0.0))
+                g.parameters_json = json.dumps(p, separators=(",", ":"))
+                return g
+
+            # Dispatch each primitive in synchronized phase order across robots.
+            reports.extend(self._dispatch_goal(build_goal))
+
         self._render_reports(reports)
 
     def _playbook_transit_distance(self):
@@ -418,6 +1194,8 @@ class TerminalOrchestrator(Node):
     # ---------------- Main loop ----------------
 
     def _main_menu(self) -> str:
+        # Keep graph data fresh before rendering choices.
+        rclpy.spin_once(self, timeout_sec=0.15)
         robots = sorted(self._robots_map().keys())
         active_target = self.selected_robot if self.selected_robot else "ALL"
         lines = [
@@ -427,8 +1205,9 @@ class TerminalOrchestrator(Node):
             f"Target: {active_target}",
             "",
             "1) Move objective (x,y)",
-            "2) Transit distance",
-            "3) Rotate degrees",
+            "2) Execute ALL commands",
+            "3) Transit distance",
+            "4) Rotate degrees",
             "",
             "t) Select target",
             "r) Refresh",
@@ -446,6 +1225,7 @@ class TerminalOrchestrator(Node):
         return input("Choice: ").strip().lower()
 
     def run_ui(self):
+        self._warmup_discovery(timeout_sec=1.2, spin_step_sec=0.1)
         while rclpy.ok():
             choice = self._main_menu()
             if choice == "q":
@@ -461,9 +1241,12 @@ class TerminalOrchestrator(Node):
                 self._playbook_move_xy()
                 continue
             if choice == "2":
-                self._playbook_transit_distance()
+                self._playbook_execute_all_commands()
                 continue
             if choice == "3":
+                self._playbook_transit_distance()
+                continue
+            if choice == "4":
                 self._playbook_rotate_degrees()
                 continue
 
