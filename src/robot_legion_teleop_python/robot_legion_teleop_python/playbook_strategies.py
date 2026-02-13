@@ -98,25 +98,31 @@ def _resolve_body_displacement(
 def _plan_omni_xy(forward_m: float, right_m: float, v_fwd: float, v_strafe: float) -> List[TimedTwistPlan]:
     if abs(forward_m) < 1e-9 and abs(right_m) < 1e-9:
         return [TimedTwistPlan(twist=Twist(), duration_s=0.0, status_text="already at target")]
+    plans: List[TimedTwistPlan] = []
 
-    t_x = _duration(forward_m, v_fwd) if abs(forward_m) > 1e-9 else 0.0
-    t_y = _duration(right_m, v_strafe) if abs(right_m) > 1e-9 else 0.0
-    duration_s = max(t_x, t_y, 1e-3)
-
-    vx = forward_m / duration_s
-    # Existing teleop/motor convention uses +linear.y as left.
-    vy = -right_m / duration_s
-    # safety clamp to commanded max speeds
-    vx = max(-abs(v_fwd), min(abs(v_fwd), vx))
-    vy = max(-abs(v_strafe), min(abs(v_strafe), vy))
-
-    return [
-        TimedTwistPlan(
-            twist=_mk_twist(vx=vx, vy=vy, wz=0.0),
-            duration_s=duration_s,
-            status_text=f"omni xy fwd={forward_m:.2f}m right={right_m:.2f}m",
+    # Keep omni objective execution predictable in tight spaces:
+    # complete forward/backward leg first, then lateral leg.
+    if abs(forward_m) > 1e-9:
+        plans.append(
+            TimedTwistPlan(
+                twist=_mk_twist(vx=abs(v_fwd) if forward_m > 0.0 else -abs(v_fwd), vy=0.0, wz=0.0),
+                duration_s=_duration(forward_m, v_fwd),
+                status_text=f"omni forward leg {forward_m:.2f}m",
+            )
         )
-    ]
+
+    if abs(right_m) > 1e-9:
+        # Existing teleop/motor convention uses +linear.y as left.
+        strafe_vy = -abs(v_strafe) if right_m > 0.0 else +abs(v_strafe)
+        plans.append(
+            TimedTwistPlan(
+                twist=_mk_twist(vx=0.0, vy=strafe_vy, wz=0.0),
+                duration_s=_duration(right_m, v_strafe),
+                status_text=f"omni strafe leg right={right_m:.2f}m",
+            )
+        )
+
+    return plans
 
 
 def _plan_diff_heading_then_transit(forward_m: float, right_m: float, v_fwd: float, w_rot: float) -> List[TimedTwistPlan]:

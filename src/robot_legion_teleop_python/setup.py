@@ -28,6 +28,7 @@ setup(
         "console_scripts": [
             # Existing nodes you have in the package tree
             "teleop_legion_key = robot_legion_teleop_python.teleop_legion_key:main",
+            "terminal_orchestrator = robot_legion_teleop_python.terminal_orchestrator:main",
             "motor_driver_node = robot_legion_teleop_python.motor_driver_node:main",
             "usb_camera_node = robot_legion_teleop_python.usb_camera_node:main",
             "fpv_control_arbiter = robot_legion_teleop_python.fpv_control_arbiter:main",

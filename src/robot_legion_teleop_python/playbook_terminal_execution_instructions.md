@@ -175,6 +175,30 @@ done
 wait
 ```
 
+### Example E: all robots move to an objective point (`transit_xy`)
+
+What it does:
+- Sends the same objective-point command to each robot (`north_m`, `east_m`).
+- Robot-specific motion strategy is selected robot-side from drive/hardware profile.
+- Mecanum robots execute objective movement as: forward/backward leg first, then strafe leg.
+
+Notes:
+- `east_m > 0` means objective is to robot-right.
+- `east_m < 0` means objective is to robot-left.
+
+```bash
+for action in "${ACTIONS[@]}"; do
+  robot="${action%/execute_playbook}"; robot="${robot#/}"
+  ros2 action send_goal --feedback "$action" fleet_orchestrator_interfaces/action/ExecutePlaybook \
+    "{intent_id: test_objective_xy_${robot}, command_id: transit_xy, parameters_json: \"{\\\"north_m\\\":1.5,\\\"east_m\\\":-0.75,\\\"speed\\\":1.0}\"}" &
+done
+wait
+```
+
+Design guidance:
+- Keep terminal commands platform-agnostic when possible (single `transit_xy` contract).
+- Put per-drive behavior (for example, mecanum forward-then-strafe vs differential axis/heading strategy) in playbook strategy code, not shell branching.
+
 ## 4) Optional: monitor action and robot state
 
 On laptop:
