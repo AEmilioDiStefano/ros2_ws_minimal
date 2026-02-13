@@ -61,6 +61,7 @@ Expected in logs:
 ```bash
 cd "$HOME/ros2_ws"
 source /opt/ros/"${ROS_DISTRO:-jazzy}"/setup.bash
+colcon build --packages-select robot_legion_teleop_python fleet_orchestrator_interfaces
 source "$HOME/ros2_ws/install/setup.bash"
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
@@ -92,7 +93,39 @@ If count is `0`, check:
 - Same `ROS_DOMAIN_ID` on laptop and all robots.
 - Robot launch logs show executor started.
 
-## 3) Example playbook commands
+## 3) Run `terminal_orchestrator.py` (recommended)
+
+Start the terminal UI:
+
+```bash
+ros2 run robot_legion_teleop_python terminal_orchestrator
+```
+
+You should see:
+- `Detected robots: <N>`
+- robot list under `Robots:`
+
+UI controls:
+- `t` choose target robots (`all` or one robot)
+- `1` Move objective `(x, y)` using `transit_xy`
+- `2` Transit distance (meters -> duration estimate)
+- `3` Rotate degrees (degrees -> duration estimate)
+- `r` refresh discovery
+- `q` quit
+
+Execution flow:
+1. Choose target robots.
+2. Choose a playbook.
+3. Enter requested values.
+4. Review `EXECUTION SUMMARY`.
+5. Confirm with `y` to dispatch.
+
+Notes:
+- Dispatch is sent to all selected robots in parallel (simultaneous start intent).
+- Distance/time is intentionally approximate and consistent across robots.
+- For `Move objective (x, y)`: `x` maps to forward/back, `y` maps to right/left.
+
+## 4) Manual CLI playbook commands (alternative)
 
 ### Example A: all robots move forward (transit primitive)
 
@@ -199,7 +232,7 @@ Design guidance:
 - Keep terminal commands platform-agnostic when possible (single `transit_xy` contract).
 - Put per-drive behavior (for example, mecanum forward-then-strafe vs differential axis/heading strategy) in playbook strategy code, not shell branching.
 
-## 4) Optional: monitor action and robot state
+## 5) Optional: monitor action and robot state
 
 On laptop:
 
