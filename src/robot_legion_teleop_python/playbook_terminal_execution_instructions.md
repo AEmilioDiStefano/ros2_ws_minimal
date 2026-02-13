@@ -126,6 +126,7 @@ Notes:
 - Distance/time is intentionally approximate and consistent across robots.
 - For `Move objective (x, y)`: `x` maps to forward/back, `y` maps to right/left.
 - Playbook `1` specifically uses all detected robots (it does not limit to the currently selected target subset).
+- Dispatch-time skip policy: if a robot blocks dispatch for more than `1.0 s`, it is skipped with explicit timeout text in output.
 
 ## 4) Manual CLI playbook commands (alternative)
 
@@ -378,19 +379,23 @@ What it does:
 2. Asks for:
    - base objective (`x`, `y`)
    - speed scale
-   - robot spacing (default `0.45 m`)
-   - formation direction in radians (relative to main robot)
    - main robot selection (anchor/reference robot)
-   - turn side (`left` or `right`) shared by all robots
+   - relative layout confirmation step:
+     - default: robots assumed in alphanumeric order with adjacent spacing `0.45 m`
+     - user can accept defaults or customize each non-main robot:
+       - distance from main robot (meters)
+       - clock direction from main robot (o'clock)
    - `MAX PATH OFFSET m` (default `0.8`)
 3. Uses deterministic linear algebra to compute trajectories:
    - main robot: one rotation + one forward/back movement (straight path to its objective)
    - other robots: two rotations + two forward/back movements
+   - non-main turn side is assigned automatically by detected order:
+     left, right, left, right, ...
 4. Enforces detour policy from the main robot straight path:
    - main robot detour target = `0`
    - second robot (next detected after main) detour target = `MAX PATH OFFSET`
    - additional robots get evenly spaced detour targets between `0` and `MAX PATH OFFSET`
-5. A shared second heading is enforced so all robots finish facing the same direction.
+5. Per-side shared second heading is enforced (left-side robots share one, right-side robots share one).
 6. Executes in synchronized phases:
    - phase 1: rotate
    - phase 2: forward leg 1
@@ -407,14 +412,31 @@ l1 * [cos(theta1), sin(theta1)] + l2 * [cos(theta2), sin(theta2)] = [dx, dy]
 
 Where:
 - `[dx, dy]` is that robot's destination vector in robot-relative frame.
-- `theta1`, `theta2` are heading angles constrained to the same turn side for all robots.
-- `theta2` is shared across robots in a run (common final facing direction).
+- `theta1`, `theta2` are heading angles constrained to that robot's assigned side.
+- `theta2` is shared within each side-group (left group and right group).
 - `l1`, `l2` are segment lengths solved from the 2x2 linear system.
 
 The planner rejects a candidate solution if:
 - matrix is singular,
 - any leg length is too small/non-forward,
 - detour from main straight path exceeds `MAX PATH OFFSET m`.
+
+Important variables (playbook `1` and dispatch):
+- `MAX PATH OFFSET m` (UI input, default `0.8`): max allowable detour from main robot straight path.
+- default adjacent spacing assumption: `0.45 m` (used to prefill relative layout).
+- per-robot relative inputs (optional override):
+  - `distance_m` from main robot
+  - `clock` direction relative to main robot (`12` forward, `3` right, `6` back, `9` left)
+- `dispatch_timeout_s` (node param, default `1.0`): wait limit for action server availability before skipping robot.
+- `send_goal_response_timeout_s` (node param, default `1.0`): wait limit for goal-accept response before skipping robot.
+
+Timeout skip behavior:
+- If either dispatch timeout is exceeded, robot is skipped for that phase.
+- Program output explicitly includes:
+  - `skipped due to timeout: waited > 1.0s ...`
+- JSON audit output includes:
+  - `status: "skipped"`
+  - `details` containing timeout cause.
 
 ### Important frame note
 

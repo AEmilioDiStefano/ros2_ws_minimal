@@ -68,11 +68,17 @@ class TerminalOrchestrator(Node):
         self.declare_parameter("base_strafe_mps", 0.35)
         self.declare_parameter("base_angular_rps", 2.00)
         self.declare_parameter("default_speed_scale", 1.0)
+        # If dispatch waits longer than this, that robot is skipped for the phase.
+        # Requested behavior: explicit 1 second skip threshold.
+        self.declare_parameter("dispatch_timeout_s", 1.0)
+        self.declare_parameter("send_goal_response_timeout_s", 1.0)
 
         self.base_linear_mps = float(self.get_parameter("base_linear_mps").value)
         self.base_strafe_mps = float(self.get_parameter("base_strafe_mps").value)
         self.base_angular_rps = float(self.get_parameter("base_angular_rps").value)
         self.default_speed_scale = float(self.get_parameter("default_speed_scale").value)
+        self.dispatch_timeout_s = float(self.get_parameter("dispatch_timeout_s").value)
+        self.send_goal_response_timeout_s = float(self.get_parameter("send_goal_response_timeout_s").value)
 
         # Do not use name "_clients": rclpy.Node already uses that internally.
         self._action_clients: Dict[str, ActionClient] = {}
@@ -457,6 +463,127 @@ class TerminalOrchestrator(Node):
             out[robot] = (x_m + k * sx, y_m + k * sy)
         return out
 
+    def _clock_to_rad(self, clock_value: float) -> float:
+        """
+        Convert clock notation to robot-relative radians.
+        Conventions used by this tool:
+        - 12 o'clock -> 0 deg (forward, +x)
+        - 3 o'clock  -> 90 deg (right, +y)
+        - 6 o'clock  -> 180 deg (backward, -x)
+        - 9 o'clock  -> 270 deg (left, -y)
+        """
+        normalized = float(clock_value) % 12.0
+        return math.radians(normalized * 30.0)
+
+    def _default_relative_robot_config(
+        self,
+        detected_robots: List[str],
+        main_robot: str,
+        default_spacing_m: float = 0.45,
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Build default relative pose assumptions from sorted robot names.
+
+        Assumption:
+        - Robots are ordered by detected alphanumeric order.
+        - Adjacent robots are spaced by default_spacing_m.
+        - Distances are measured from main_robot.
+        - Robots with lower index than main default to 9 o'clock side.
+        - Robots with higher index than main default to 3 o'clock side.
+        """
+        out: Dict[str, Dict[str, float]] = {}
+        ordered = list(detected_robots)
+        if main_robot not in ordered:
+            for r in ordered:
+                if r != main_robot:
+                    out[r] = {"distance_m": default_spacing_m, "clock": 3.0}
+            return out
+
+        main_idx = ordered.index(main_robot)
+        for idx, robot in enumerate(ordered):
+            if robot == main_robot:
+                continue
+            k = idx - main_idx
+            dist = abs(k) * float(default_spacing_m)
+            # If dist resolves to 0 due to malformed order, still keep a safe default.
+            if dist < 1e-6:
+                dist = float(default_spacing_m)
+            clock = 9.0 if k < 0 else 3.0
+            out[robot] = {"distance_m": dist, "clock": clock}
+        return out
+
+    def _prompt_relative_robot_config(
+        self,
+        detected_robots: List[str],
+        main_robot: str,
+        defaults: Dict[str, Dict[str, float]],
+    ) -> Optional[Dict[str, Dict[str, float]]]:
+        """
+        Ask user to confirm defaults or customize each non-main robot's
+        distance and clock-direction relative to the main robot.
+        """
+        lines = [
+            "Default relative config:",
+            f"Main: {main_robot}",
+            "Assume same heading for all.",
+            "Distances from main robot:",
+            "",
+        ]
+        for robot in detected_robots:
+            if robot == main_robot:
+                continue
+            d = defaults.get(robot, {}).get("distance_m", 0.45)
+            c = defaults.get(robot, {}).get("clock", 3.0)
+            lines.append(f"{robot}: {d:.2f}m @ {c:.1f} o'clock")
+        lines.extend(["", "Use defaults? [Y/n]"])
+        self._print_screen("RELATIVE CONFIG", lines)
+        use_defaults = input("> ").strip().lower()
+        if use_defaults in ("", "y", "yes"):
+            return defaults
+        if use_defaults in ("b", "back", "q", "quit"):
+            return None
+
+        # Custom per-robot inputs.
+        custom: Dict[str, Dict[str, float]] = {}
+        for robot in detected_robots:
+            if robot == main_robot:
+                continue
+            d_default = float(defaults.get(robot, {}).get("distance_m", 0.45))
+            c_default = float(defaults.get(robot, {}).get("clock", 3.0))
+
+            self._print_screen(
+                "ROBOT DISTANCE",
+                [
+                    f"{robot} is ___ meters",
+                    f"from {main_robot}.",
+                    "",
+                    "Enter distance in meters.",
+                    "Type 'back' to cancel.",
+                ],
+            )
+            dist = self._prompt_float(f"{robot} distance m", default=d_default, allow_zero=False)
+            if dist is None:
+                return None
+
+            self._print_screen(
+                "ROBOT CLOCK",
+                [
+                    f"From main robot ({main_robot}),",
+                    f"{robot} is at ___ o'clock.",
+                    "",
+                    "3 -> right, 6 -> back, 9 -> left",
+                    "Type 'back' to cancel.",
+                ],
+            )
+            clock = self._prompt_float(f"{robot} o'clock", default=c_default, allow_zero=False)
+            if clock is None:
+                return None
+            # Keep clock in [0, 12) for stable rendering.
+            clock = float(clock) % 12.0
+            custom[robot] = {"distance_m": float(dist), "clock": clock}
+
+        return custom
+
     # ---------------- ROS discovery/action ----------------
 
     def _discover_action_servers(self) -> List[Tuple[str, str]]:
@@ -572,9 +699,24 @@ class TerminalOrchestrator(Node):
         # Phase 1: send all goals first so robots can start at roughly the same time.
         for robot, action_name in targets:
             client = self._get_or_make_client(action_name)
-            if not client.wait_for_server(timeout_sec=2.0):
+            if not client.wait_for_server(timeout_sec=self.dispatch_timeout_s):
+                reason = (
+                    f"skipped due to timeout: waited > {self.dispatch_timeout_s:.1f}s "
+                    "for action server"
+                )
+                self._emit_json_event(
+                    "audit",
+                    {
+                        "type": "audit_event",
+                        "stage": "execute_playbook_dispatch",
+                        "intent_id": "",
+                        "robot": robot,
+                        "status": "skipped",
+                        "details": reason,
+                    },
+                )
                 reports.append(
-                    GoalReport(robot=robot, accepted=False, success=False, reason="server unavailable")
+                    GoalReport(robot=robot, accepted=False, success=False, reason=reason)
                 )
                 continue
             goal = goal_factory(robot)
@@ -606,15 +748,30 @@ class TerminalOrchestrator(Node):
         # Wait for send_goal responses.
         self._spin_until(
             lambda: all(state["send_future"].done() for state in pending.values()),
-            timeout_sec=5.0,
+            timeout_sec=self.send_goal_response_timeout_s,
         )
 
         result_pending: Dict[str, Dict[str, object]] = {}
         for robot, state in pending.items():
             send_future = state["send_future"]
             if not send_future.done():
+                reason = (
+                    f"skipped due to timeout: waited > {self.send_goal_response_timeout_s:.1f}s "
+                    "for send_goal response"
+                )
+                self._emit_json_event(
+                    "audit",
+                    {
+                        "type": "audit_event",
+                        "stage": "execute_playbook_dispatch",
+                        "intent_id": str(state.get("intent_id", "")),
+                        "robot": robot,
+                        "status": "skipped",
+                        "details": reason,
+                    },
+                )
                 reports.append(
-                    GoalReport(robot=robot, accepted=False, success=False, reason="goal send timeout")
+                    GoalReport(robot=robot, accepted=False, success=False, reason=reason)
                 )
                 continue
 
@@ -788,20 +945,10 @@ class TerminalOrchestrator(Node):
         if speed is None:
             return
         speed = max(0.05, min(1.5, speed))
-
-        spacing_m = self._prompt_float("robot spacing m", default=0.45, allow_zero=False)
-        if spacing_m is None:
-            return
-        formation_dir_rad = self._prompt_float("formation dir rad", default=0.0)
-        if formation_dir_rad is None:
-            return
         max_detour_m = self._prompt_float("MAX PATH OFFSET m", default=0.8, allow_zero=False)
         if max_detour_m is None:
             return
         max_detour_m = max(0.05, float(max_detour_m))
-
-        turn_side_raw = input("turn side [left/right] [left]: ").strip().lower()
-        turn_side = turn_side_raw if turn_side_raw in ("left", "right") else "left"
 
         # Ask user to pick main robot (anchor); all destinations are defined relative to it.
         self._print_screen(
@@ -813,33 +960,69 @@ class TerminalOrchestrator(Node):
                 "",
             ] + [f"{i+1}) {r}" for i, r in enumerate(detected_robots)],
         )
-        main_choice = input("Main robot index [1]: ").strip()
-        main_idx = 1
-        if main_choice:
-            try:
-                main_idx = int(main_choice)
-            except ValueError:
+        # Mitigate invalid selection by requiring a valid index or explicit default enter.
+        while True:
+            main_choice = input("Main robot index [1]: ").strip()
+            if main_choice == "":
                 main_idx = 1
-        main_idx = min(max(main_idx, 1), len(detected_robots))
+                break
+            if main_choice.lower() in ("b", "back", "q", "quit"):
+                return
+            try:
+                parsed = int(main_choice)
+            except ValueError:
+                print("Invalid index. Enter a number from the list.")
+                continue
+            if 1 <= parsed <= len(detected_robots):
+                main_idx = parsed
+                break
+            print(f"Invalid index. Choose 1..{len(detected_robots)}.")
         main_robot = detected_robots[main_idx - 1]
 
-        goal_vectors = self._robot_goal_vectors_for_formation(
-            robots=detected_robots,
-            anchor_robot=main_robot,
-            x_m=float(x_m),
-            y_m=float(y_m),
-            spacing_m=float(spacing_m),
-            formation_dir_rad=float(formation_dir_rad),
+        # Relative robot configuration prompt:
+        # defaults are auto-derived from detected order with 0.45 m adjacent spacing.
+        default_rel = self._default_relative_robot_config(
+            detected_robots=detected_robots,
+            main_robot=main_robot,
+            default_spacing_m=0.45,
         )
+        rel_cfg = self._prompt_relative_robot_config(
+            detected_robots=detected_robots,
+            main_robot=main_robot,
+            defaults=default_rel,
+        )
+        if rel_cfg is None:
+            return
+
+        # Build per-robot target vectors from base objective + relative offsets.
+        goal_vectors: Dict[str, Tuple[float, float]] = {main_robot: (float(x_m), float(y_m))}
+        for robot in detected_robots:
+            if robot == main_robot:
+                continue
+            cfg = rel_cfg.get(robot, {"distance_m": 0.45, "clock": 3.0})
+            dist = float(cfg.get("distance_m", 0.45))
+            clock = float(cfg.get("clock", 3.0))
+            rad = self._clock_to_rad(clock)
+            # Relative offset in robot frame:
+            # +x forward, +y right.
+            ox = dist * math.cos(rad)
+            oy = dist * math.sin(rad)
+            goal_vectors[robot] = (float(x_m) + ox, float(y_m) + oy)
 
         # Reference straight path is main robot's start->goal line.
         main_goal = goal_vectors.get(main_robot, (float(x_m), float(y_m)))
         ref_line = main_goal if math.hypot(main_goal[0], main_goal[1]) > 1e-9 else (1.0, 0.0)
 
-        side_sign = +1.0 if turn_side == "left" else -1.0
+        # Auto side assignment tree for non-main robots:
+        # left, right, left, right, ... in detected order.
+        side_for_robot: Dict[str, str] = {}
+        non_main_order = [r for r in detected_robots if r != main_robot]
+        for i, robot in enumerate(non_main_order):
+            side_for_robot[robot] = "left" if (i % 2 == 0) else "right"
+
+        # Base heading magnitude uses the main goal direction.
         base_heading = math.atan2(float(main_goal[1]), float(main_goal[0])) if (abs(main_goal[0]) + abs(main_goal[1])) > 1e-9 else 0.0
-        # Shared terminal heading for non-main robots so all end with same orientation.
-        theta2_common = side_sign * min(math.radians(60.0), max(math.radians(12.0), abs(base_heading) + math.radians(8.0)))
+        theta2_abs = min(math.radians(60.0), max(math.radians(12.0), abs(base_heading) + math.radians(8.0)))
 
         # Detour assignment rule:
         # - main robot: 0 (straight path)
@@ -875,9 +1058,9 @@ class TerminalOrchestrator(Node):
                 plan = self._plan_two_leg_deterministic(
                     dx=dx,
                     dy=dy,
-                    turn_side=turn_side,
+                    turn_side=side_for_robot.get(robot, "left"),
                     max_detour_m=max_detour_m,
-                    theta2_fixed=theta2_common,
+                    theta2_fixed=(+theta2_abs if side_for_robot.get(robot, "left") == "left" else -theta2_abs),
                     target_max_detour_m=float(detour_targets.get(robot, 0.0)),
                     ref_line_dir_xy=ref_line,
                 )
@@ -895,14 +1078,14 @@ class TerminalOrchestrator(Node):
                     ", ".join(failures),
                     "",
                     "Try: larger MAX PATH OFFSET",
-                    "or different turn side.",
+                    "or smaller spacing offset.",
                 ],
             )
             self._pause()
             return
 
         est_total_seq = 0.0
-        for robot in target_robots:
+        for robot in detected_robots:
             p = plans[robot]
             r1 = abs(p.theta1) / max(1e-6, self.base_angular_rps * speed)
             t1 = abs(p.length1_m) / max(1e-6, self.base_linear_mps * speed)
@@ -917,9 +1100,10 @@ class TerminalOrchestrator(Node):
             "",
             f"Main robot: {main_robot}",
             f"Base x={x_m:.2f} y={y_m:.2f}",
-            f"Spacing={spacing_m:.2f} m",
-            f"Formation dir={formation_dir_rad:.3f} rad",
-            f"Turn side={turn_side}",
+            "Relative config: custom/default",
+            "(distance + clock per robot)",
+            "Side assignment: auto",
+            "(left,right,left,...)",
             f"MAX PATH OFFSET={max_detour_m:.2f} m",
             "",
             f"Est phase total: {est_total_seq:.2f} s",
@@ -938,6 +1122,13 @@ class TerminalOrchestrator(Node):
                 f"detour={p.max_detour_m:.2f}m "
                 f"target={detour_targets.get(robot, 0.0):.2f}m"
             )
+            if robot != main_robot:
+                summary.append(f"  side={side_for_robot.get(robot, 'left')}")
+                cfg = rel_cfg.get(robot, {"distance_m": 0.45, "clock": 3.0})
+                summary.append(
+                    f"  rel={float(cfg.get('distance_m', 0.45)):.2f}m "
+                    f"@ {float(cfg.get('clock', 3.0)):.1f} o'clock"
+                )
 
         if not self._confirm(summary):
             return
@@ -970,9 +1161,8 @@ class TerminalOrchestrator(Node):
                     "x_m": x_m,
                     "y_m": y_m,
                     "speed": speed,
-                    "spacing_m": spacing_m,
-                    "formation_dir_rad": formation_dir_rad,
-                    "turn_side": turn_side,
+                    "relative_robot_config": rel_cfg,
+                    "side_assignment_mode": "auto_alternating_left_right",
                     "max_path_offset_m": max_detour_m,
                     "main_robot": main_robot,
                     "secondary_robot": secondary_robot,
