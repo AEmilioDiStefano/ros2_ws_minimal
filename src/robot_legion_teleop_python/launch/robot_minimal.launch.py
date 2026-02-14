@@ -24,6 +24,14 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+def _default_workspace_profiles_path() -> str:
+    """
+    Prefer the live workspace profile file so launch behavior does not silently
+    drift to an older installed YAML.
+    """
+    return os.path.expanduser("~/ros2_ws/src/robot_legion_teleop_python/config/robot_profiles.yaml")
+
+
 def generate_launch_description() -> LaunchDescription:
     default_robot_name = os.environ.get("USER", "robot")
 
@@ -35,8 +43,8 @@ def generate_launch_description() -> LaunchDescription:
 
     profiles_path_arg = DeclareLaunchArgument(
         "profiles_path",
-        default_value="",
-        description="Optional path to robot_profiles.yaml; empty uses installed config.",
+        default_value=_default_workspace_profiles_path(),
+        description="Path to robot_profiles.yaml (defaults to workspace config path).",
     )
 
     common_params = [

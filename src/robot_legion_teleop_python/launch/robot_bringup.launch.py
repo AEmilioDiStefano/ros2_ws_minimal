@@ -9,6 +9,14 @@ import getpass
 from ament_index_python.packages import get_package_share_directory
 
 
+def _default_workspace_profiles_path() -> str:
+    """
+    Prefer the live workspace profile file so launch behavior does not silently
+    drift to an older installed YAML.
+    """
+    return os.path.expanduser("~/ros2_ws/src/robot_legion_teleop_python/config/robot_profiles.yaml")
+
+
 def _sanitize_ros_name(name: str) -> str:
     # ROS name/topic-safe: alphanumerics + underscore only
     s = re.sub(r"[^A-Za-z0-9_]", "_", (name or "").strip())
@@ -40,7 +48,10 @@ def _make_nodes(context, *args, **kwargs):
     use_camera = LaunchConfiguration("use_camera").perform(context).lower() in ("1", "true", "yes", "on")
     drive_type = LaunchConfiguration("drive_type").perform(context)
     hardware = LaunchConfiguration("hardware").perform(context)
-    profiles_path = LaunchConfiguration("profiles_path").perform(context) or ""
+    profiles_path = (
+        LaunchConfiguration("profiles_path").perform(context).strip()
+        or _default_workspace_profiles_path()
+    )
 
     nodes = []
 
@@ -169,8 +180,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "profiles_path",
-                default_value="",
-                description="Optional path to custom robot_profiles.yaml file (empty = use installed default)",
+                default_value=_default_workspace_profiles_path(),
+                description="Path to robot_profiles.yaml (defaults to workspace config path).",
             ),
             OpaqueFunction(function=_make_nodes),
         ]

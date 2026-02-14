@@ -119,6 +119,7 @@ UI controls:
 - `3` Transit distance (meters -> duration estimate)
 - `4` Rotate degrees (degrees -> duration estimate)
 - `s` Playbook sequence (queue multiple playbooks before running)
+- `!` STOP ALL ROBOTS (best-effort software stop)
 - `r` refresh discovery
 - `q` quit
 
@@ -130,6 +131,9 @@ Playbook sequence submenu:
   - `d` delete last queued playbook
   - `c` clear queue
   - `b` back
+  - `u` update queued playbook by entry number
+  - `x` delete queued playbook by entry number
+  - `!` STOP ALL ROBOTS
 - Sequence execute behavior (`e`):
   - non-interactive per step (no per-step pause, no per-step confirmation).
   - one final `SEQUENCE SUMMARY` screen after the queue run.
@@ -398,9 +402,26 @@ ros2 topic echo /fo/task
 ros2 topic echo /fo/audit
 ```
 
+## 6.1 Emergency stop behavior
+
+`terminal_orchestrator` includes a global software stop command:
+- `!`, `stop`, `k`, `kill`, `5`, or `space` in menu/prompt contexts triggers `STOP ALL ROBOTS`.
+- It dispatches a short `hold` command (`duration_s: 0.3`) to all reachable robots.
+- During active motion/spin waits, terminal input is line-buffered:
+  enter a stop token and press Enter.
+- Available from:
+  - main menu
+  - target select menu
+  - execute playbook sequence menu
+  - numeric prompts
+  - execution confirm prompt
+- After stop:
+  - from main/playbook flows: returns to main menu
+  - from sequence flow: returns to `EXECUTE PLAYBOOK SEQUENCE`
+
 ## 7) Detected-Robot Coordinated XY mode (option `1`)
 
-`1) Move objective (x,y)` now runs a coordinated planner over all currently detected robots.
+`1) Move to objective` runs a coordinated planner over all currently detected robots.
 
 What it does:
 1. Uses all detected robots.
@@ -409,32 +430,31 @@ What it does:
      - defaults: `x=1.0`, `y=1.0` (non-zero 2D default objective)
    - speed scale
    - main robot selection (anchor/reference robot)
-   - relative layout confirmation step:
-    - default: robots assumed in alphanumeric order with adjacent spacing `0.45 m`
-       (line formation; neighbor-to-neighbor spacing is 45 cm)
-     - user can accept defaults or customize each non-main robot:
-       - distance from main robot (meters)
-       - clock direction from main robot (o'clock)
-       - heading direction relative to main robot (o'clock)
+   - initial heading confirmation step for non-main robots:
+     - default: all non-main robots are assumed to face the same direction as main (`12 o'clock`)
+     - user can customize heading clock per non-main robot
    - `MAX PATH OFFSET m` (default `0.8`)
 3. Uses deterministic linear algebra to compute trajectories:
-   - main robot: one rotation + one forward/back movement (straight path to its objective)
-   - other robots: two rotations + two forward/back movements
+   - all robots share the SAME objective point `(x, y)`
+   - main robot: one rotation + one forward/back movement (shortest straight path)
+   - non-main robots: two rotations + two forward/back movements (V-shaped path)
    - non-main turn side is auto-selected from destination geometry:
      - if `dy > 0` (target to robot-right), planner prefers `left` side
      - if `dy < 0` (target to robot-left), planner prefers `right` side
      - if `dy ~= 0`, planner uses alternating hint (`left,right,left,...`)
      - if preferred side is infeasible, planner retries opposite side automatically
-   - all robots converge to a shared final heading (same direction at destination),
-     using main robot objective heading as the common final heading
+   - core decomposition logic for non-main robots:
+     - compute two vectors `v1`, `v2` such that `v1 + v2 = destination_vector`
+     - execute leg1 along `v1`, then leg2 along `v2`
+     - this gives a deterministic V-path without requiring fallback
    - when custom heading is provided for non-main robots, planner converts
-     destination vectors from main frame into each robot frame so the resulting
-     motion is aligned to the main robot direction
+     the shared objective from main frame into each robot frame before solving
 4. Enforces detour policy from the main robot straight path:
    - main robot detour target = `0`
    - second robot (next detected after main) detour target = `MAX PATH OFFSET`
    - additional robots get evenly spaced detour targets between `0` and `MAX PATH OFFSET`
-5. Per-side shared second heading is enforced (left-side robots share one, right-side robots share one).
+5. Non-main final headings are not globally forced to be equal; they follow the
+   solved V-path geometry.
 6. Executes in synchronized phases:
    - phase 1: rotate
    - phase 2: forward leg 1
@@ -451,9 +471,9 @@ l1 * [cos(theta1), sin(theta1)] + l2 * [cos(theta2), sin(theta2)] = [dx, dy]
 
 Where:
 - `[dx, dy]` is that robot's destination vector in robot-relative frame.
-- `theta1`, `theta2` are heading angles constrained to that robot's assigned side.
-- `theta2` is shared within each side-group (left group and right group).
-- `l1`, `l2` are segment lengths solved from the 2x2 linear system.
+- `v1 = l1*[cos(theta1), sin(theta1)]`
+- `v2 = l2*[cos(theta2), sin(theta2)]`
+- planner chooses `theta1/theta2` (side-aware) and `l1/l2` so `v1 + v2 = [dx,dy]`.
 
 The planner rejects a candidate solution if:
 - matrix is singular,
@@ -461,18 +481,13 @@ The planner rejects a candidate solution if:
 - detour from main straight path exceeds `MAX PATH OFFSET m`.
 
 Feasibility robustness:
-- Internal heading envelope for first-leg heading scan is up to `85 deg`,
-  which improves feasibility for larger lateral goals.
-- Second leg heading is fixed to the shared common final heading so all
-  robots end aligned in orientation.
+- V-path decomposition is solved directly from vector addition, which removes
+  most infeasibility cases seen with over-constrained heading coupling.
 
 Important variables (playbook `1` and dispatch):
 - `MAX PATH OFFSET m` (UI input, default `0.8`): max allowable detour from main robot straight path.
-- default adjacent spacing assumption: `0.45 m` (used to prefill relative layout).
-- per-robot relative inputs (optional override):
-  - `distance_m` from main robot
-  - `clock` direction relative to main robot (`12` forward, `3` right, `6` back, `9` left)
-  - `heading_clock` direction relative to main robot (`12` means same direction)
+- per-robot heading input (optional override):
+  - `heading_clock` relative to main robot (`12` means same direction)
 - per-robot duration calibration (in `robot_profiles.yaml`, `robots.<name>.params.drive`):
   - `orchestrator_linear_duration_scale`
   - `orchestrator_angular_duration_scale`
@@ -480,7 +495,7 @@ Important variables (playbook `1` and dispatch):
 - side selection mode for non-main robots:
   - `auto_dy_sign_with_fallback` (preferred side from `dy`, fallback to opposite side if needed)
 - final heading mode:
-  - `shared_common_heading` (all robots end with the same heading)
+  - `non_main_v_path_variable_heading` (non-main robots end at V-path-derived heading)
 - `dispatch_timeout_s` (node param, default `1.0`): wait limit for action server availability before skipping robot.
 - `send_goal_response_timeout_s` (node param, default `1.0`): wait limit for goal-accept response before skipping robot.
 
@@ -495,8 +510,8 @@ Timeout skip behavior:
 ### Important frame note
 
 All vectors are command-executed robot-relative.
-When custom `heading_clock` is provided, terminal_orchestrator compensates by
-rotating each non-main robot target vector into that robot's local frame.
+For playbook `1`, the objective is shared in main-robot frame and transformed
+into each non-main robot frame using `heading_clock`.
 
 Custom heading prompt format (per non-main robot):
 

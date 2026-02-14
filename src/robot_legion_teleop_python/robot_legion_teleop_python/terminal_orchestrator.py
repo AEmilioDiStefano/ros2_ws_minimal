@@ -15,9 +15,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import select
 import sys
+import termios
 import time
+import tty
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -91,6 +95,9 @@ class TerminalOrchestrator(Node):
 
         # Do not use name "_clients": rclpy.Node already uses that internally.
         self._action_clients: Dict[str, ActionClient] = {}
+        self._active_goal_handles: Dict[str, object] = {}
+        self._cmd_vel_pubs: Dict[str, object] = {}
+        self._in_emergency_stop = False
         self.selected_robot: Optional[str] = None  # None => all robots
 
         # Fleet-style JSON event emission for integration testing.
@@ -161,6 +168,125 @@ class TerminalOrchestrator(Node):
     def _pause(self, text: str = "Press Enter..."):
         input((text + " ").strip())
 
+    def _is_stop_cmd(self, raw: str) -> bool:
+        s_raw = str(raw or "")
+        s = s_raw.strip().lower()
+        return s in ("!", "stop", "kill", "k", "5") or s_raw == " "
+
+    def _get_or_make_cmd_vel_pub(self, robot: str):
+        topic = f"/{robot}/cmd_vel"
+        pub = self._cmd_vel_pubs.get(topic)
+        if pub is None:
+            pub = self.create_publisher(Twist, topic, 10)
+            self._cmd_vel_pubs[topic] = pub
+        return pub
+
+    def _poll_stop_stdin(self) -> bool:
+        """
+        Non-blocking stop poll for long-running spin loops.
+        Terminal is line-buffered, so user should press Enter after stop token.
+        """
+        try:
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+        except Exception:
+            return False
+        if not rlist:
+            return False
+        try:
+            raw = sys.stdin.readline()
+        except Exception:
+            return False
+        return self._is_stop_cmd(raw)
+
+    def _poll_stop_keypress(self) -> bool:
+        """
+        Non-blocking single-key stop poll (no Enter required).
+
+        Requires terminal cbreak mode to be active in the current thread.
+        """
+        if not sys.stdin.isatty():
+            return False
+        try:
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+        except Exception:
+            return False
+        if not rlist:
+            return False
+        try:
+            chunk = os.read(sys.stdin.fileno(), 32).decode("utf-8", errors="ignore")
+        except Exception:
+            return False
+        if not chunk:
+            return False
+        for ch in chunk:
+            if ch in ("!", "5", " "):
+                return True
+        return False
+
+    def _emergency_stop_all(self, show_ui: bool = True):
+        """
+        Dispatch immediate HOLD to all currently reachable robots.
+
+        This is a best-effort e-stop style software stop for orchestrated motion.
+        """
+        if self._in_emergency_stop:
+            return
+        self._in_emergency_stop = True
+        try:
+            # 1) Cancel active action goals initiated by this orchestrator.
+            cancel_futures = []
+            for handle in list(self._active_goal_handles.values()):
+                try:
+                    cancel_futures.append(handle.cancel_goal_async())
+                except Exception:
+                    pass
+            if cancel_futures:
+                self._spin_until(
+                    lambda: all(f.done() for f in cancel_futures),
+                    timeout_sec=0.6,
+                    step_sec=0.05,
+                )
+
+            # 2) Push zero cmd_vel directly to each reachable robot for immediate brake.
+            robots = sorted(self._robots_map().keys())
+            if not robots:
+                if show_ui:
+                    self._print_screen(
+                        "STOP ALL ROBOTS",
+                        [
+                            "No reachable robots found.",
+                        ],
+                    )
+                    self._pause()
+                return
+
+            zero = Twist()
+            for _ in range(4):
+                for robot in robots:
+                    try:
+                        self._get_or_make_cmd_vel_pub(robot).publish(zero)
+                    except Exception:
+                        pass
+                # Keep ROS pumping briefly between stop bursts.
+                rclpy.spin_once(self, timeout_sec=0.03)
+
+            # 3) Also dispatch short HOLD commands as a secondary safety net.
+            now = int(time.time())
+
+            def build_goal(robot: str) -> ExecutePlaybook.Goal:
+                g = ExecutePlaybook.Goal()
+                g.intent_id = f"term_stop_{robot}_{now}"
+                g.command_id = "hold"
+                g.vehicle_ids = [robot]
+                g.parameters_json = json.dumps({"duration_s": 0.3, "speed": 1.0}, separators=(",", ":"))
+                return g
+
+            reports = self._dispatch_goal(build_goal, target_robots=robots, allow_interrupt=False)
+            if show_ui:
+                self._render_reports(reports)
+        finally:
+            self._in_emergency_stop = False
+
     def _prompt_float(
         self,
         label: str,
@@ -169,13 +295,18 @@ class TerminalOrchestrator(Node):
     ) -> Optional[float]:
         while True:
             if default is None:
-                raw = input(f"{label}: ").strip()
+                raw_in = input(f"{label}: ")
+                raw = raw_in.strip()
             else:
-                raw = input(f"{label} [{default}]: ").strip()
+                raw_in = input(f"{label} [{default}]: ")
+                raw = raw_in.strip()
                 if raw == "":
                     return float(default)
 
             if raw.lower() in ("q", "quit", "b", "back"):
+                return None
+            if self._is_stop_cmd(raw_in):
+                self._emergency_stop_all()
                 return None
             try:
                 val = float(raw)
@@ -320,6 +451,21 @@ class TerminalOrchestrator(Node):
             max(0.1, min(5.0, linear_scale)),
             max(0.1, min(5.0, angular_scale)),
         )
+
+    def _detour_scale_for_robot(self, robot: Optional[str]) -> float:
+        """
+        Resolve per-robot detour aggressiveness scale for playbook 1.
+        1.0 = unchanged, <1.0 = less aggressive V-path detours.
+        """
+        scale = 1.0
+        if robot and self._profile_registry:
+            try:
+                prof = resolve_robot_profile(self._profile_registry, robot)
+                dp = prof.get("drive_params", {}) or {}
+                scale = float(dp.get("orchestrator_max_detour_scale", scale))
+            except Exception:
+                pass
+        return max(0.1, min(1.0, scale))
 
     def _rotation_params_from_delta(
         self, delta_rad: float, speed_scale: float, robot: Optional[str] = None
@@ -482,6 +628,66 @@ class TerminalOrchestrator(Node):
             )
         return best
 
+    def _plan_two_leg_vector_sum(
+        self,
+        dx: float,
+        dy: float,
+        turn_side: str,
+        target_detour_m: float,
+        max_detour_m: float,
+        ref_line_dir_xy: Tuple[float, float],
+    ) -> TwoLegPlan:
+        """
+        Closed-form 2-vector decomposition for V-path motion.
+
+        We construct two vectors that sum exactly to the destination vector:
+          v1 + v2 = d
+        with symmetric headings around destination direction:
+          theta1 = theta_goal + s*alpha
+          theta2 = theta_goal - s*alpha
+
+        This guarantees a valid decomposition with positive lengths:
+          l1 = l2 = |d| / (2*cos(alpha))
+        for alpha in [0, pi/2).
+        """
+        d = math.hypot(dx, dy)
+        if d < 1e-9:
+            return TwoLegPlan(
+                theta1=0.0,
+                theta2=0.0,
+                length1_m=0.0,
+                length2_m=0.0,
+                max_detour_m=0.0,
+            )
+
+        theta_goal = math.atan2(dy, dx)
+        side_sign = +1.0 if turn_side == "left" else -1.0
+
+        # Desired geometric detour from straight destination line.
+        # For symmetric V, max perpendicular distance h = (|d|/2)*tan(alpha).
+        h = max(0.0, min(float(target_detour_m), float(max_detour_m)))
+        alpha = math.atan2(2.0 * h, d) if h > 1e-9 else 0.0
+        alpha = min(alpha, math.radians(85.0))
+
+        c = max(1e-6, math.cos(alpha))
+        l = d / (2.0 * c)
+        theta1 = theta_goal + side_sign * alpha
+        theta2 = theta_goal - side_sign * alpha
+
+        wx = l * math.cos(theta1)
+        wy = l * math.sin(theta1)
+        d_waypoint = abs(self._signed_distance_to_line((wx, wy), ref_line_dir_xy))
+        d_goal = abs(self._signed_distance_to_line((dx, dy), ref_line_dir_xy))
+        achieved = max(d_waypoint, d_goal)
+
+        return TwoLegPlan(
+            theta1=theta1,
+            theta2=theta2,
+            length1_m=l,
+            length2_m=l,
+            max_detour_m=achieved,
+        )
+
     def _robot_goal_vectors_for_formation(
         self,
         robots: List[str],
@@ -529,117 +735,52 @@ class TerminalOrchestrator(Node):
         normalized = float(clock_value) % 12.0
         return math.radians(normalized * 30.0)
 
-    def _default_relative_robot_config(
+    def _default_heading_config(
         self,
         detected_robots: List[str],
         main_robot: str,
-        default_spacing_m: float = 0.45,
     ) -> Dict[str, Dict[str, float]]:
         """
-        Build default relative pose assumptions from sorted robot names.
-
-        Assumption:
-        - Robots are ordered by detected alphanumeric order.
-        - Adjacent robots are spaced by default_spacing_m.
-        - Distances are measured from main_robot.
-        - Robots with lower index than main default to 9 o'clock side.
-        - Robots with higher index than main default to 3 o'clock side.
+        Default heading assumptions for non-main robots.
+        - 12 o'clock means same heading as main robot.
         """
         out: Dict[str, Dict[str, float]] = {}
-        ordered = list(detected_robots)
-        if main_robot not in ordered:
-            for r in ordered:
-                if r != main_robot:
-                    out[r] = {"distance_m": default_spacing_m, "clock": 3.0, "heading_clock": 12.0}
-            return out
-
-        main_idx = ordered.index(main_robot)
-        for idx, robot in enumerate(ordered):
+        for robot in detected_robots:
             if robot == main_robot:
                 continue
-            k = idx - main_idx
-            dist = abs(k) * float(default_spacing_m)
-            # If dist resolves to 0 due to malformed order, still keep a safe default.
-            if dist < 1e-6:
-                dist = float(default_spacing_m)
-            clock = 9.0 if k < 0 else 3.0
-            out[robot] = {"distance_m": dist, "clock": clock, "heading_clock": 12.0}
+            out[robot] = {"heading_clock": 12.0}
         return out
 
-    def _prompt_relative_robot_config(
+    def _prompt_heading_config(
         self,
         detected_robots: List[str],
         main_robot: str,
         defaults: Dict[str, Dict[str, float]],
     ) -> Optional[Dict[str, Dict[str, float]]]:
         """
-        Ask user to confirm defaults or customize each non-main robot's:
-        - distance from main robot,
-        - position clock-direction relative to main robot,
-        - heading clock-direction relative to main robot.
+        Ask whether all robots start with same heading as main, or capture
+        per-robot heading clock values.
         """
         lines = [
-            "Default relative config:",
+            "Initial heading config:",
             f"Main: {main_robot}",
-            "Assume same heading for all.",
-            "Distances from main robot:",
+            "All robots same heading?",
+            "(12 o'clock means yes)",
             "",
+            "Use defaults? [Y/n]",
         ]
-        for robot in detected_robots:
-            if robot == main_robot:
-                continue
-            d = defaults.get(robot, {}).get("distance_m", 0.45)
-            c = defaults.get(robot, {}).get("clock", 3.0)
-            h = defaults.get(robot, {}).get("heading_clock", 12.0)
-            lines.append(f"{robot}: {d:.2f}m @ {c:.1f} o'clock")
-            lines.append(f"  heading -> {h:.1f} o'clock")
-        lines.extend(["", "Use defaults? [Y/n]"])
-        self._print_screen("RELATIVE CONFIG", lines)
+        self._print_screen("HEADING CONFIG", lines)
         use_defaults = input("> ").strip().lower()
         if use_defaults in ("", "y", "yes"):
             return defaults
-        if use_defaults in ("b", "back", "q", "quit"):
+        if use_defaults in ("b", "back", "q", "quit", "0"):
             return None
 
-        # Custom per-robot inputs.
         custom: Dict[str, Dict[str, float]] = {}
         for robot in detected_robots:
             if robot == main_robot:
                 continue
-            d_default = float(defaults.get(robot, {}).get("distance_m", 0.45))
-            c_default = float(defaults.get(robot, {}).get("clock", 3.0))
             h_default = float(defaults.get(robot, {}).get("heading_clock", 12.0))
-
-            self._print_screen(
-                "ROBOT DISTANCE",
-                [
-                    f"{robot} is ___ meters",
-                    f"from {main_robot}.",
-                    "",
-                    "Enter distance in meters.",
-                    "Type 'back' to cancel.",
-                ],
-            )
-            dist = self._prompt_float(f"{robot} distance m", default=d_default, allow_zero=False)
-            if dist is None:
-                return None
-
-            self._print_screen(
-                "ROBOT CLOCK",
-                [
-                    f"From main robot ({main_robot}),",
-                    f"{robot} is at ___ o'clock.",
-                    "",
-                    "3 -> right, 6 -> back, 9 -> left",
-                    "Type 'back' to cancel.",
-                ],
-            )
-            clock = self._prompt_float(f"{robot} o'clock", default=c_default, allow_zero=False)
-            if clock is None:
-                return None
-            # Keep clock in [0, 12) for stable rendering.
-            clock = float(clock) % 12.0
-
             self._print_screen(
                 "ROBOT HEADING",
                 [
@@ -659,13 +800,7 @@ class TerminalOrchestrator(Node):
             )
             if heading_clock is None:
                 return None
-            heading_clock = float(heading_clock) % 12.0
-            custom[robot] = {
-                "distance_m": float(dist),
-                "clock": clock,
-                "heading_clock": heading_clock,
-            }
-
+            custom[robot] = {"heading_clock": float(heading_clock) % 12.0}
         return custom
 
     # ---------------- ROS discovery/action ----------------
@@ -788,16 +923,44 @@ class TerminalOrchestrator(Node):
 
     def _spin_until(self, done_fn, timeout_sec: float, step_sec: float = 0.05) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
-        while rclpy.ok():
-            if done_fn():
-                return True
-            now = time.monotonic()
-            if now >= deadline:
-                return done_fn()
-            rclpy.spin_once(self, timeout_sec=min(step_sec, deadline - now))
-        return done_fn()
+        fd = None
+        old_tty = None
+        cbreak_on = False
+        if (not self._in_emergency_stop) and sys.stdin.isatty():
+            try:
+                fd = sys.stdin.fileno()
+                old_tty = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+                cbreak_on = True
+            except Exception:
+                cbreak_on = False
+        try:
+            while rclpy.ok():
+                if not self._in_emergency_stop:
+                    # Immediate one-key stop path first.
+                    if self._poll_stop_keypress() or self._poll_stop_stdin():
+                        self._emergency_stop_all(show_ui=False)
+                        return done_fn()
+                if done_fn():
+                    return True
+                now = time.monotonic()
+                if now >= deadline:
+                    return done_fn()
+                rclpy.spin_once(self, timeout_sec=min(step_sec, deadline - now))
+            return done_fn()
+        finally:
+            if cbreak_on and fd is not None and old_tty is not None:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_tty)
+                except Exception:
+                    pass
 
-    def _dispatch_goal(self, goal_factory, target_robots: Optional[List[str]] = None) -> List[GoalReport]:
+    def _dispatch_goal(
+        self,
+        goal_factory,
+        target_robots: Optional[List[str]] = None,
+        allow_interrupt: bool = True,
+    ) -> List[GoalReport]:
         robots_map = self._robots_map()
         if target_robots is None:
             targets = self._target_actions(robots_map)
@@ -902,6 +1065,7 @@ class TerminalOrchestrator(Node):
                 )
                 continue
 
+            self._active_goal_handles[robot] = goal_handle
             result_pending[robot] = {
                 "future": goal_handle.get_result_async(),
                 "intent_id": state.get("intent_id", ""),
@@ -931,6 +1095,7 @@ class TerminalOrchestrator(Node):
                 reports.append(
                     GoalReport(robot=robot, accepted=True, success=False, reason="result timeout")
                 )
+                self._active_goal_handles.pop(robot, None)
                 continue
 
             wrapped = result_future.result()
@@ -950,6 +1115,7 @@ class TerminalOrchestrator(Node):
                 reports.append(
                     GoalReport(robot=robot, accepted=True, success=False, reason="empty result")
                 )
+                self._active_goal_handles.pop(robot, None)
                 continue
 
             success = bool(getattr(result_msg, "success", True))
@@ -970,6 +1136,7 @@ class TerminalOrchestrator(Node):
             reports.append(
                 GoalReport(robot=robot, accepted=accepted, success=success, reason=reason)
             )
+            self._active_goal_handles.pop(robot, None)
 
         return reports
 
@@ -986,10 +1153,20 @@ class TerminalOrchestrator(Node):
             ]
             for i, robot in enumerate(robots, start=1):
                 lines.append(f"{i}) {robot}")
-            lines.extend(["", "b) back"])
+            lines.extend(
+                [
+                    "",
+                    "!) STOP ALL ROBOTS",
+                    "b) back",
+                ]
+            )
             self._print_screen("TARGET SELECT", lines)
 
-            choice = input("Choice: ").strip().lower()
+            raw_choice = input("Choice: ")
+            choice = raw_choice.strip().lower()
+            if self._is_stop_cmd(raw_choice):
+                self._emergency_stop_all()
+                continue
             if choice in ("b", "back", "q", "quit"):
                 return
             if choice == "a":
@@ -1019,13 +1196,28 @@ class TerminalOrchestrator(Node):
             self._pause()
 
     def _confirm(self, summary_lines: List[str]) -> bool:
-        self._print_screen("EXECUTION SUMMARY", summary_lines + ["", "EXECUTE? y/n"])
-        answer = input("> ").strip().lower()
+        self._print_screen(
+            "EXECUTION SUMMARY",
+            summary_lines
+            + [
+                "",
+                "EXECUTE? y/n",
+                "STOP ALL: ! / stop",
+                "or space / 5",
+            ],
+        )
+        raw_answer = input("> ")
+        answer = raw_answer.strip().lower()
+        if self._is_stop_cmd(raw_answer):
+            self._emergency_stop_all()
+            return False
         return answer in ("y", "yes")
 
     # ---------------- Playbook sequence submenu ----------------
 
-    def _collect_sequence_entry(self, choice: str) -> Optional[Dict[str, Any]]:
+    def _collect_sequence_entry(
+        self, choice: str, existing_entry: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Build a queued sequence entry for the selected playbook.
 
@@ -1034,6 +1226,8 @@ class TerminalOrchestrator(Node):
           planning form (main robot, relative config, heading clocks, etc).
         - Playbooks 2/3/4 capture variables up front and execute later.
         """
+        existing_params = dict((existing_entry or {}).get("params", {}) or {})
+
         if choice == "1":
             detected_robots = sorted(self._robots_map().keys())
             if not detected_robots:
@@ -1047,21 +1241,32 @@ class TerminalOrchestrator(Node):
                 self._pause()
                 return None
 
-            x_m = self._prompt_float("x meters", default=1.0)
+            x_default = float(existing_params.get("x_m", 1.0))
+            y_default = float(existing_params.get("y_m", 1.0))
+            speed_default = float(existing_params.get("speed", self.default_speed_scale))
+            max_detour_default = float(existing_params.get("max_detour_m", 0.8))
+
+            x_m = self._prompt_float("x meters", default=x_default)
             if x_m is None:
                 return None
-            y_m = self._prompt_float("y meters", default=1.0)
+            y_m = self._prompt_float("y meters", default=y_default)
             if y_m is None:
                 return None
-            speed = self._prompt_float("speed scale", default=self.default_speed_scale, allow_zero=False)
+            speed = self._prompt_float("speed scale", default=speed_default, allow_zero=False)
             if speed is None:
                 return None
             speed = max(0.05, min(1.5, float(speed)))
-            max_detour_m = self._prompt_float("MAX PATH OFFSET m", default=0.8, allow_zero=False)
+            max_detour_m = self._prompt_float(
+                "MAX PATH OFFSET m", default=max_detour_default, allow_zero=False
+            )
             if max_detour_m is None:
                 return None
             max_detour_m = max(0.05, float(max_detour_m))
 
+            existing_main_robot = str(existing_params.get("main_robot", "")).strip()
+            default_main_idx = 1
+            if existing_main_robot in detected_robots:
+                default_main_idx = detected_robots.index(existing_main_robot) + 1
             self._print_screen(
                 "MAIN ROBOT SELECT",
                 [
@@ -1072,39 +1277,51 @@ class TerminalOrchestrator(Node):
                 ] + [f"{i+1}) {r}" for i, r in enumerate(detected_robots)],
             )
             while True:
-                main_choice = input("Main robot index [1]: ").strip()
+                main_choice = input(f"Main robot index [{default_main_idx}]: ").strip()
                 if main_choice == "":
-                    main_idx = 1
+                    main_idx = default_main_idx
                     break
                 if main_choice.lower() in ("b", "back", "q", "quit", "0"):
                     return None
                 try:
                     parsed = int(main_choice)
                 except ValueError:
-                    print("Invalid index. Enter a number from the list.")
-                    continue
+                    print("Invalid index. Auto-selecting 1.")
+                    main_idx = 1
+                    break
                 if 1 <= parsed <= len(detected_robots):
                     main_idx = parsed
                     break
-                print(f"Invalid index. Choose 1..{len(detected_robots)}.")
+                print("Invalid index. Auto-selecting 1.")
+                main_idx = 1
+                break
             main_robot = detected_robots[main_idx - 1]
 
-            default_rel = self._default_relative_robot_config(
+            default_head = self._default_heading_config(
                 detected_robots=detected_robots,
                 main_robot=main_robot,
-                default_spacing_m=0.45,
             )
-            rel_cfg = self._prompt_relative_robot_config(
+            existing_heading_cfg = dict(existing_params.get("heading_cfg", {}) or {})
+            for robot in detected_robots:
+                if robot == main_robot:
+                    continue
+                if robot in existing_heading_cfg:
+                    try:
+                        h = float(existing_heading_cfg[robot].get("heading_clock", 12.0))
+                    except Exception:
+                        h = 12.0
+                    default_head[robot] = {"heading_clock": h % 12.0}
+            heading_cfg = self._prompt_heading_config(
                 detected_robots=detected_robots,
                 main_robot=main_robot,
-                defaults=default_rel,
+                defaults=default_head,
             )
-            if rel_cfg is None:
+            if heading_cfg is None:
                 return None
 
             return {
                 "playbook": "move_xy",
-                "label": "Move objective (x,y)",
+                "label": "Move to objective",
                 "params": {
                     "detected_robots": detected_robots,
                     "x_m": float(x_m),
@@ -1112,12 +1329,13 @@ class TerminalOrchestrator(Node):
                     "speed": float(speed),
                     "max_detour_m": float(max_detour_m),
                     "main_robot": str(main_robot),
-                    "rel_cfg": rel_cfg,
+                    "heading_cfg": heading_cfg,
                 },
                 "deferred_input": False,
             }
         if choice == "2":
-            speed = self._prompt_float("speed scale", default=0.8, allow_zero=False)
+            speed_default = float(existing_params.get("speed", 1.0))
+            speed = self._prompt_float("speed scale", default=speed_default, allow_zero=False)
             if speed is None:
                 return None
             speed = max(0.05, min(1.5, float(speed)))
@@ -1128,10 +1346,12 @@ class TerminalOrchestrator(Node):
                 "deferred_input": False,
             }
         if choice == "3":
-            meters = self._prompt_float("distance meters", default=1.0, allow_zero=False)
+            meters_default = float(existing_params.get("meters", 1.0))
+            speed_default = float(existing_params.get("speed", self.default_speed_scale))
+            meters = self._prompt_float("distance meters", default=meters_default, allow_zero=False)
             if meters is None:
                 return None
-            speed = self._prompt_float("speed scale", default=self.default_speed_scale, allow_zero=False)
+            speed = self._prompt_float("speed scale", default=speed_default, allow_zero=False)
             if speed is None:
                 return None
             speed = max(0.05, min(1.5, float(speed)))
@@ -1142,10 +1362,12 @@ class TerminalOrchestrator(Node):
                 "deferred_input": False,
             }
         if choice == "4":
-            degrees = self._prompt_float("degrees", default=45.0, allow_zero=False)
+            degrees_default = float(existing_params.get("degrees", 45.0))
+            speed_default = float(existing_params.get("speed", self.default_speed_scale))
+            degrees = self._prompt_float("degrees", default=degrees_default, allow_zero=False)
             if degrees is None:
                 return None
-            speed = self._prompt_float("speed scale", default=self.default_speed_scale, allow_zero=False)
+            speed = self._prompt_float("speed scale", default=speed_default, allow_zero=False)
             if speed is None:
                 return None
             speed = max(0.05, min(1.5, float(speed)))
@@ -1155,6 +1377,18 @@ class TerminalOrchestrator(Node):
                 "params": {"degrees": float(degrees), "speed": speed},
                 "deferred_input": False,
             }
+        return None
+
+    def _sequence_choice_for_entry(self, entry: Dict[str, Any]) -> Optional[str]:
+        playbook = str(entry.get("playbook", ""))
+        if playbook == "move_xy":
+            return "1"
+        if playbook == "execute_all_commands":
+            return "2"
+        if playbook == "transit_distance":
+            return "3"
+        if playbook == "rotate_degrees":
+            return "4"
         return None
 
     def _execute_sequence_entry(self, entry: Dict[str, Any], seq_index: int, seq_total: int) -> Dict[str, Any]:
@@ -1168,14 +1402,14 @@ class TerminalOrchestrator(Node):
                 speed=float(params.get("speed", self.default_speed_scale)),
                 max_detour_m=float(params.get("max_detour_m", 0.8)),
                 main_robot=str(params.get("main_robot", "")),
-                rel_cfg=dict(params.get("rel_cfg", {}) or {}),
+                heading_cfg=dict(params.get("heading_cfg", {}) or {}),
                 require_confirm=False,
                 render_result=False,
             )
             return {
                 "step": seq_index,
                 "playbook": "move_xy",
-                "label": "Move objective (x,y)",
+                "label": "Move to objective",
                 "status": "completed" if bool(run.get("ok", False)) else "failed",
                 "reason": str(run.get("reason", "")),
                 "reports": list(run.get("reports", [])),
@@ -1183,7 +1417,7 @@ class TerminalOrchestrator(Node):
 
         if playbook == "execute_all_commands":
             params = entry.get("params", {}) or {}
-            speed = max(0.05, min(1.5, float(params.get("speed", 0.8))))
+            speed = max(0.05, min(1.5, float(params.get("speed", 1.0))))
             # Reuse existing implementation behavior by routing through direct command plan.
             # Keep this as the same primitive sweep and target semantics as menu option 2.
             now = int(time.time())
@@ -1309,7 +1543,7 @@ class TerminalOrchestrator(Node):
                 "return to the main menu",
                 "",
                 "Add playbook:",
-                "1) Move objective (x,y)",
+                "1) Move to objective",
                 "2) Execute ALL commands",
                 "3) Transit distance",
                 "4) Rotate degrees",
@@ -1318,6 +1552,12 @@ class TerminalOrchestrator(Node):
                 "d) Delete last queued",
                 "c) Clear queue",
                 "b) Back",
+                "!) STOP ALL ROBOTS",
+                "",
+                "Entry management:",
+                "u) Update by number",
+                "x) Delete by number",
+                "",
             ]
             if queue:
                 lines.append("")
@@ -1330,13 +1570,50 @@ class TerminalOrchestrator(Node):
                 lines.append("Queue empty")
 
             self._print_screen("EXECUTE PLAYBOOK SEQUENCE", lines)
-            choice = input("Choice: ").strip().lower()
+            raw_choice = input("Choice: ")
+            choice = raw_choice.strip().lower()
+            if self._is_stop_cmd(raw_choice):
+                self._emergency_stop_all()
+                continue
 
             if choice in ("0", "b", "back", "q", "quit"):
                 return
             if choice in ("d", "del", "delete"):
                 if queue:
                     queue.pop()
+                continue
+            if choice in ("u", "update"):
+                if not queue:
+                    continue
+                idx_raw = input("Entry number to update: ").strip()
+                if idx_raw.lower() in ("b", "back", "0", "q", "quit"):
+                    continue
+                try:
+                    idx = int(idx_raw)
+                except ValueError:
+                    continue
+                if not (1 <= idx <= len(queue)):
+                    continue
+                current = queue[idx - 1]
+                mapped_choice = self._sequence_choice_for_entry(current)
+                if mapped_choice is None:
+                    continue
+                updated = self._collect_sequence_entry(mapped_choice, existing_entry=current)
+                if updated is not None:
+                    queue[idx - 1] = updated
+                continue
+            if choice in ("x", "remove", "rm", "delete_num"):
+                if not queue:
+                    continue
+                idx_raw = input("Entry number to delete: ").strip()
+                if idx_raw.lower() in ("b", "back", "0", "q", "quit"):
+                    continue
+                try:
+                    idx = int(idx_raw)
+                except ValueError:
+                    continue
+                if 1 <= idx <= len(queue):
+                    queue.pop(idx - 1)
                 continue
             if choice in ("c", "clear"):
                 queue.clear()
@@ -1449,7 +1726,7 @@ class TerminalOrchestrator(Node):
         speed: float,
         max_detour_m: float,
         main_robot: str,
-        rel_cfg: Dict[str, Dict[str, float]],
+        heading_cfg: Dict[str, Dict[str, float]],
         require_confirm: bool = True,
         render_result: bool = True,
     ) -> Dict[str, Any]:
@@ -1466,27 +1743,21 @@ class TerminalOrchestrator(Node):
         if main_robot not in detected_robots:
             return {"ok": False, "reason": f"main robot '{main_robot}' not in detected robots", "reports": []}
 
-        # Build per-robot target vectors from base objective + relative offsets.
+        # Build per-robot target vectors to the SAME objective.
+        # Main-frame objective is (x_m, y_m) for all robots.
         goal_vectors: Dict[str, Tuple[float, float]] = {main_robot: (float(x_m), float(y_m))}
         robot_heading_offset_rad: Dict[str, float] = {main_robot: 0.0}
         for robot in detected_robots:
             if robot == main_robot:
                 continue
-            cfg = rel_cfg.get(robot, {"distance_m": 0.45, "clock": 3.0, "heading_clock": 12.0})
-            dist = float(cfg.get("distance_m", 0.45))
-            clock = float(cfg.get("clock", 3.0))
+            cfg = heading_cfg.get(robot, {"heading_clock": 12.0})
             heading_clock = float(cfg.get("heading_clock", 12.0))
-            rad = self._clock_to_rad(clock)
             heading_rad = self._clock_to_rad(heading_clock)
             robot_heading_offset_rad[robot] = heading_rad
-            # Relative offset in robot frame:
-            # +x forward, +y right.
-            ox = dist * math.cos(rad)
-            oy = dist * math.sin(rad)
-            # World/main-frame target for this robot then transformed into the
+            # Same world/main-frame objective for each robot, transformed into the
             # robot's local frame using its heading offset vs main robot.
-            tx_main = float(x_m) + ox
-            ty_main = float(y_m) + oy
+            tx_main = float(x_m)
+            ty_main = float(y_m)
             tx_robot, ty_robot = self._rotate_vector_into_robot_frame(
                 tx_main, ty_main, heading_rad
             )
@@ -1508,9 +1779,8 @@ class TerminalOrchestrator(Node):
         for i, robot in enumerate(non_main_order):
             alt_side_hint[robot] = "left" if (i % 2 == 0) else "right"
 
-        # All robots should finish facing the same direction.
-        # Use the main robot objective direction as the common final heading.
-        common_theta2_main = (
+        # Main objective heading (used for main robot shortest-path plan).
+        main_heading = (
             math.atan2(float(main_goal[1]), float(main_goal[0]))
             if (abs(main_goal[0]) + abs(main_goal[1])) > 1e-9
             else 0.0
@@ -1532,6 +1802,7 @@ class TerminalOrchestrator(Node):
                 detour_targets[robot] = i * step
 
         plans: Dict[str, TwoLegPlan] = {}
+        fallback_mode: Dict[str, str] = {}
         failures: List[str] = []
         for robot in detected_robots:
             dx, dy = goal_vectors[robot]
@@ -1546,6 +1817,7 @@ class TerminalOrchestrator(Node):
                     length2_m=0.0,
                     max_detour_m=abs(self._signed_distance_to_line((dx, dy), ref_line)),
                 )
+                fallback_mode[robot] = "straight_main"
             else:
                 if dy > 1e-6:
                     preferred_side = "left"
@@ -1559,20 +1831,20 @@ class TerminalOrchestrator(Node):
                 best_plan: Optional[TwoLegPlan] = None
                 best_side: Optional[str] = None
                 best_score: Optional[Tuple[float, float]] = None
+                detour_scale = self._detour_scale_for_robot(robot)
+                target_detour = float(detour_targets.get(robot, 0.0)) * detour_scale
+                max_detour_for_robot = float(max_detour_m) * detour_scale
                 for side in candidate_sides:
-                    candidate = self._plan_two_leg_deterministic(
+                    candidate = self._plan_two_leg_vector_sum(
                         dx=dx,
                         dy=dy,
                         turn_side=side,
-                        max_detour_m=max_detour_m,
-                        theta2_fixed=(common_theta2_main - float(robot_heading_offset_rad.get(robot, 0.0))),
-                        target_max_detour_m=float(detour_targets.get(robot, 0.0)),
+                        target_detour_m=target_detour,
+                        max_detour_m=max_detour_for_robot,
                         ref_line_dir_xy=ref_line,
                     )
-                    if candidate is None:
-                        continue
                     score = (
-                        abs(candidate.max_detour_m - float(detour_targets.get(robot, 0.0))),
+                        abs(candidate.max_detour_m - target_detour),
                         candidate.length1_m + candidate.length2_m,
                     )
                     if best_score is None or score < best_score:
@@ -1583,9 +1855,10 @@ class TerminalOrchestrator(Node):
                 plan = best_plan
                 if plan is None:
                     failures.append(robot)
-                else:
-                    side_for_robot[robot] = best_side or preferred_side
-                    plans[robot] = plan
+                    continue
+                side_for_robot[robot] = best_side or preferred_side
+                fallback_mode[robot] = "v_plan"
+                plans[robot] = plan
 
         if failures:
             return {
@@ -1610,14 +1883,17 @@ class TerminalOrchestrator(Node):
         summary = [
             f"Target: {target_text}",
             "Mode: detected-robot XY",
+            "Intent: same objective all robots",
             "",
             f"Main robot: {main_robot}",
             f"Base x={x_m:.2f} y={y_m:.2f}",
-            "Relative config: custom/default",
-            "(distance + clock per robot)",
+            "Main path: shortest straight",
+            "Non-main: V path (2 legs)",
+            "V-plan: two vectors sum",
+            "to destination vector",
             "Side assignment: auto",
             "(dy-sign preferred, fallback)",
-            f"Common final heading={math.degrees(common_theta2_main):.1f} deg",
+            f"Main heading={math.degrees(main_heading):.1f} deg",
             f"MAX PATH OFFSET={max_detour_m:.2f} m",
             "",
             f"Est phase total: {est_total_seq:.2f} s",
@@ -1636,13 +1912,11 @@ class TerminalOrchestrator(Node):
                 f"detour={p.max_detour_m:.2f}m "
                 f"target={detour_targets.get(robot, 0.0):.2f}m"
             )
+            summary.append(f"  mode={fallback_mode.get(robot, 'v_plan')}")
             if robot != main_robot:
-                summary.append(f"  side={side_for_robot.get(robot, 'left')}")
-                cfg = rel_cfg.get(robot, {"distance_m": 0.45, "clock": 3.0, "heading_clock": 12.0})
-                summary.append(
-                    f"  rel={float(cfg.get('distance_m', 0.45)):.2f}m "
-                    f"@ {float(cfg.get('clock', 3.0)):.1f} o'clock"
-                )
+                if fallback_mode.get(robot) == "v_plan":
+                    summary.append(f"  side={side_for_robot.get(robot, 'left')}")
+                cfg = heading_cfg.get(robot, {"heading_clock": 12.0})
                 summary.append(
                     f"  heading={float(cfg.get('heading_clock', 12.0)):.1f} o'clock"
                 )
@@ -1678,10 +1952,10 @@ class TerminalOrchestrator(Node):
                     "x_m": x_m,
                     "y_m": y_m,
                     "speed": speed,
-                    "relative_robot_config": rel_cfg,
+                    "heading_config": heading_cfg,
                     "side_assignment_mode": "auto_dy_sign_with_fallback",
-                    "final_heading_mode": "shared_common_heading",
-                    "common_final_heading_deg": math.degrees(common_theta2_main),
+                    "final_heading_mode": "non_main_v_path_variable_heading",
+                    "main_heading_deg": math.degrees(main_heading),
                     "max_path_offset_m": max_detour_m,
                     "main_robot": main_robot,
                     "secondary_robot": secondary_robot,
@@ -1702,6 +1976,7 @@ class TerminalOrchestrator(Node):
                         "theta2_deg": math.degrees(plans[robot].theta2),
                         "length1_m": plans[robot].length1_m,
                         "length2_m": plans[robot].length2_m,
+                        "planner_mode": fallback_mode.get(robot, "v_plan"),
                         "max_detour_m": plans[robot].max_detour_m,
                         "target_detour_m": detour_targets.get(robot, 0.0),
                     }
@@ -1718,8 +1993,18 @@ class TerminalOrchestrator(Node):
             )
             return _build_phase_goal(robot, "p1_rotate", "rotate", params)
 
-        phase_reports.extend(self._dispatch_goal(build_phase1, target_robots=detected_robots))
-        if any((not r.success) for r in phase_reports[-len(detected_robots):]):
+        phase1_reports = self._dispatch_goal(build_phase1, target_robots=detected_robots)
+        phase_reports.extend(phase1_reports)
+        if len(phase1_reports) == 0:
+            reason = (
+                "Move-to-objective failed: phase 1 rotate had zero dispatched targets. "
+                "No reachable robots responded."
+            )
+            if render_result:
+                self._print_screen("MOVE TO OBJECTIVE FAILED", [reason])
+                self._pause()
+            return {"ok": False, "reason": reason, "reports": phase_reports}
+        if any((not r.success) for r in phase_reports[-len(phase1_reports):]):
             if render_result:
                 self._render_reports(phase_reports)
             return {"ok": False, "reason": "phase 1 failed", "reports": phase_reports}
@@ -1732,8 +2017,18 @@ class TerminalOrchestrator(Node):
             )
             return _build_phase_goal(robot, "p2_transit", "transit", params)
 
-        phase_reports.extend(self._dispatch_goal(build_phase2, target_robots=detected_robots))
-        if any((not r.success) for r in phase_reports[-len(detected_robots):]):
+        phase2_reports = self._dispatch_goal(build_phase2, target_robots=detected_robots)
+        phase_reports.extend(phase2_reports)
+        if len(phase2_reports) == 0:
+            reason = (
+                "Move-to-objective failed: phase 2 transit had zero dispatched targets. "
+                "No reachable robots responded."
+            )
+            if render_result:
+                self._print_screen("MOVE TO OBJECTIVE FAILED", [reason])
+                self._pause()
+            return {"ok": False, "reason": reason, "reports": phase_reports}
+        if any((not r.success) for r in phase_reports[-len(phase2_reports):]):
             if render_result:
                 self._render_reports(phase_reports)
             return {"ok": False, "reason": "phase 2 failed", "reports": phase_reports}
@@ -1746,8 +2041,18 @@ class TerminalOrchestrator(Node):
             )
             return _build_phase_goal(robot, "p3_rotate", "rotate", params)
 
-        phase_reports.extend(self._dispatch_goal(build_phase3, target_robots=detected_robots))
-        if any((not r.success) for r in phase_reports[-len(detected_robots):]):
+        phase3_reports = self._dispatch_goal(build_phase3, target_robots=detected_robots)
+        phase_reports.extend(phase3_reports)
+        if len(phase3_reports) == 0:
+            reason = (
+                "Move-to-objective failed: phase 3 rotate had zero dispatched targets. "
+                "No reachable robots responded."
+            )
+            if render_result:
+                self._print_screen("MOVE TO OBJECTIVE FAILED", [reason])
+                self._pause()
+            return {"ok": False, "reason": reason, "reports": phase_reports}
+        if any((not r.success) for r in phase_reports[-len(phase3_reports):]):
             if render_result:
                 self._render_reports(phase_reports)
             return {"ok": False, "reason": "phase 3 failed", "reports": phase_reports}
@@ -1760,7 +2065,17 @@ class TerminalOrchestrator(Node):
             )
             return _build_phase_goal(robot, "p4_transit", "transit", params)
 
-        phase_reports.extend(self._dispatch_goal(build_phase4, target_robots=detected_robots))
+        phase4_reports = self._dispatch_goal(build_phase4, target_robots=detected_robots)
+        phase_reports.extend(phase4_reports)
+        if len(phase4_reports) == 0:
+            reason = (
+                "Move-to-objective failed: phase 4 transit had zero dispatched targets. "
+                "No reachable robots responded."
+            )
+            if render_result:
+                self._print_screen("MOVE TO OBJECTIVE FAILED", [reason])
+                self._pause()
+            return {"ok": False, "reason": reason, "reports": phase_reports}
         if render_result:
             self._render_reports(phase_reports)
         return {"ok": True, "reason": "ok", "reports": phase_reports}
@@ -1769,11 +2084,11 @@ class TerminalOrchestrator(Node):
         self._print_screen(
             "PLAYBOOK: MOVE XY",
             [
-                "detected-robot XY planner",
+                "detected-robot objective",
                 "x: forward(+) backward(-)",
                 "y: right(+) left(-)",
                 "main robot goes straight",
-                "others use 2-leg planner",
+                "others use V-path planner",
                 "",
                 "Type 'back' to cancel",
             ],
@@ -1825,38 +2140,49 @@ class TerminalOrchestrator(Node):
             try:
                 parsed = int(main_choice)
             except ValueError:
-                print("Invalid index. Enter a number from the list.")
-                continue
+                print("Invalid index. Auto-selecting 1.")
+                main_idx = 1
+                break
             if 1 <= parsed <= len(detected_robots):
                 main_idx = parsed
                 break
-            print(f"Invalid index. Choose 1..{len(detected_robots)}.")
+            print("Invalid index. Auto-selecting 1.")
+            main_idx = 1
+            break
         main_robot = detected_robots[main_idx - 1]
 
-        default_rel = self._default_relative_robot_config(
+        default_head = self._default_heading_config(
             detected_robots=detected_robots,
             main_robot=main_robot,
-            default_spacing_m=0.45,
         )
-        rel_cfg = self._prompt_relative_robot_config(
+        heading_cfg = self._prompt_heading_config(
             detected_robots=detected_robots,
             main_robot=main_robot,
-            defaults=default_rel,
+            defaults=default_head,
         )
-        if rel_cfg is None:
+        if heading_cfg is None:
             return
 
-        self._run_move_xy_with_params(
+        run = self._run_move_xy_with_params(
             detected_robots=detected_robots,
             x_m=float(x_m),
             y_m=float(y_m),
             speed=float(speed),
             max_detour_m=float(max_detour_m),
             main_robot=main_robot,
-            rel_cfg=rel_cfg,
+            heading_cfg=heading_cfg,
             require_confirm=True,
             render_result=True,
         )
+        if not bool(run.get("ok", False)):
+            reason = str(run.get("reason", "")).strip()
+            # Keep user-cancel as quiet back-to-menu behavior.
+            if reason and reason != "user cancelled":
+                self._print_screen(
+                    "MOVE TO OBJECTIVE FAILED",
+                    [reason],
+                )
+                self._pause()
 
     def _playbook_execute_all_commands(self):
         """
@@ -1874,7 +2200,7 @@ class TerminalOrchestrator(Node):
             ],
         )
 
-        speed = self._prompt_float("speed scale", default=0.8, allow_zero=False)
+        speed = self._prompt_float("speed scale", default=1.0, allow_zero=False)
         if speed is None:
             return
         speed = max(0.05, min(1.5, speed))
@@ -2105,12 +2431,14 @@ class TerminalOrchestrator(Node):
             f"Detected robots: {len(robots)}",
             f"Target: {active_target}",
             "",
-            "1) Move objective (x,y)",
+            "1) Move to objective",
             "2) Execute ALL commands",
             "3) Transit distance",
             "4) Rotate degrees",
             "",
             "s) Playbook sequence",
+            "",
+            "!) STOP ALL ROBOTS",
             "",
             "t) Select target",
             "r) Refresh",
@@ -2125,12 +2453,18 @@ class TerminalOrchestrator(Node):
             lines.append("")
             lines.append("No execute_playbook servers")
         self._print_screen("TERMINAL ORCHESTRATOR", lines)
-        return input("Choice: ").strip().lower()
+        raw_choice = input("Choice: ")
+        if self._is_stop_cmd(raw_choice):
+            return "__STOP__"
+        return raw_choice.strip().lower()
 
     def run_ui(self):
         self._warmup_discovery(timeout_sec=1.2, spin_step_sec=0.1)
         while rclpy.ok():
             choice = self._main_menu()
+            if choice == "__STOP__":
+                self._emergency_stop_all()
+                continue
             if choice == "q":
                 return
             if choice == "r":
