@@ -39,9 +39,15 @@ from rclpy.node import Node
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
 
 from geometry_msgs.msg import Twist
+from std_msgs.msg import String
 import threading
 
-from fleet_orchestrator_interfaces.action import ExecutePlaybook
+try:
+    from fleet_orchestrator_interfaces.action import ExecutePlaybook
+    HAS_FLEET_ACTION = True
+except Exception:
+    ExecutePlaybook = None  # type: ignore[assignment]
+    HAS_FLEET_ACTION = False
 
 from .drive_profiles import load_profile_registry, resolve_robot_profile
 from .playbook_helpers import TimedTwistPlan, run_timed_twist
@@ -135,14 +141,31 @@ class UnitExecutor(Node):
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
 
         self.action_name = f"/{self.robot}/execute_playbook"
-        self.server = ActionServer(
-            self,
-            ExecutePlaybook,
-            self.action_name,
-            execute_callback=self.execute_cb,
-            goal_callback=self.goal_cb,
-            cancel_callback=self.cancel_cb,
+        self.command_topic = f"/{self.robot}/execute_playbook_cmd"
+        self.result_topic = f"/{self.robot}/execute_playbook_result"
+        self.result_pub = self.create_publisher(String, self.result_topic, 10)
+        self.command_sub = self.create_subscription(
+            String,
+            self.command_topic,
+            self._command_topic_cb,
+            10,
         )
+
+        self.server = None
+        if HAS_FLEET_ACTION:
+            self.server = ActionServer(
+                self,
+                ExecutePlaybook,
+                self.action_name,
+                execute_callback=self.execute_cb,
+                goal_callback=self.goal_cb,
+                cancel_callback=self.cancel_cb,
+            )
+        else:
+            self.get_logger().warning(
+                f"[{self.robot}] fleet_orchestrator_interfaces missing; "
+                f"running standalone topic interface on {self.command_topic}"
+            )
 
         # Active goals mapping: id(goal_handle) -> threading.Event
         self._active_goals = {}
@@ -152,7 +175,9 @@ class UnitExecutor(Node):
         self.audit = AuditLogger(self, "unit_executor", audit_log_path)
 
         self.get_logger().info(f"[{self.robot}] UnitExecutor ready")
-        self.get_logger().info(f"[{self.robot}] action={self.action_name}")
+        if HAS_FLEET_ACTION:
+            self.get_logger().info(f"[{self.robot}] action={self.action_name}")
+        self.get_logger().info(f"[{self.robot}] cmd_iface={self.command_topic}")
         self.get_logger().info(
             f"[{self.robot}] drive_type={self.drive_type} hardware={self.hardware} "
             f"profile={self.profile_name} cmd_vel={self.cmd_vel_topic}"
@@ -286,46 +311,75 @@ class UnitExecutor(Node):
         if hasattr(result_msg, "result_text"):
             result_msg.result_text = str(text)
 
-    # ---------------- executor ----------------
-    def execute_cb(self, goal_handle):
+    def _emit_topic_result(
+        self,
+        *,
+        intent_id: str,
+        command_id: str,
+        success: bool,
+        reason: str,
+    ) -> None:
+        payload = {
+            "type": "playbook_result",
+            "robot": self.robot,
+            "intent_id": intent_id,
+            "command_id": command_id,
+            "success": bool(success),
+            "reason": str(reason),
+        }
+        msg = String()
+        msg.data = json.dumps(payload, separators=(",", ":"))
+        self.result_pub.publish(msg)
+
+    def _execute_command_core(
+        self,
+        *,
+        command_id: str,
+        parameters_json: str,
+        intent_id: str,
+        north_m_typed: float = 0.0,
+        east_m_typed: float = 0.0,
+        feedback_cb=None,
+        stop_event=None,
+    ) -> Tuple[bool, str, Dict[str, object]]:
         """
-        Execute a validated goal by publishing a timed Twist.
+        Shared command executor used by both:
+        - Action interface (ExecutePlaybook)
+        - Standalone topic interface (/execute_playbook_cmd)
         """
-        goal = goal_handle.request
-        feedback = ExecutePlaybook.Feedback()
-        intent_id = goal.intent_id if hasattr(goal, "intent_id") else "unknown"
         goal_start_time = time.time()
 
-        ok, err, parsed = validate_and_normalize(goal.command_id, goal.parameters_json)
+        ok, err, parsed = validate_and_normalize(command_id, parameters_json)
         if not ok or parsed is None:
             self.get_logger().warn(f"[{self.robot}] execute rejected late: {err}")
+            try:
+                raw_params = json.loads(parameters_json or "{}")
+            except Exception:
+                raw_params = {}
             self.audit.log_command(
                 robot=self.robot,
                 source="orchestrator",
-                command_id=goal.command_id,
-                parameters=json.loads(goal.parameters_json or "{}"),
+                command_id=command_id,
+                parameters=raw_params,
                 status="failed",
                 source_id=intent_id,
                 details=err,
                 duration_s=time.time() - goal_start_time,
             )
-            goal_handle.abort()
-            result = ExecutePlaybook.Result()
-            self._set_result_safe(result, success=False, text=err)
-            return result
+            return False, err, {}
 
         def fb(percent: float, text: str):
-            self._publish_feedback_safe(goal_handle, feedback, percent, text)
-
-        # Create a stop event so cancel requests can interrupt run_timed_twist
-        stop_event = threading.Event()
-        self._active_goals[id(goal_handle)] = stop_event
+            if callable(feedback_cb):
+                try:
+                    feedback_cb(percent, text)
+                except Exception:
+                    pass
 
         # Log goal execution start
         self.audit.log_command(
             robot=self.robot,
             source="orchestrator",
-            command_id=goal.command_id,
+            command_id=command_id,
             parameters=parsed.raw_params,
             status="started",
             source_id=intent_id,
@@ -342,7 +396,9 @@ class UnitExecutor(Node):
         duration_s = parsed.duration_s
         selected_strategy = ""
 
-        # Implement primitives.
+        if stop_event is None:
+            stop_event = threading.Event()
+
         if cid == "hold":
             plan = TimedTwistPlan(twist=Twist(), duration_s=duration_s, status_text="holding")
             run_timed_twist(self._publish, fb, plan, rate_hz=10.0, stop_at_end=True, stop_event=stop_event)
@@ -360,9 +416,6 @@ class UnitExecutor(Node):
             run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
 
         elif cid == "strafe":
-            # Safe behavior:
-            # - mecanum: publish y velocity
-            # - diff: ignore strafe (publish zero Twist unless you decide otherwise)
             twist = Twist()
             if self.drive_type == "mecanum":
                 twist.linear.y = +vy if direction in ("left", "+y") else -vy
@@ -384,7 +437,6 @@ class UnitExecutor(Node):
             run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
 
         elif cid == "turn":
-            # "turn" is curved on diff, rotate on mecanum (safe + predictable).
             twist = Twist()
             if self.drive_type == "diff_drive":
                 twist.linear.x = turn_v
@@ -397,18 +449,13 @@ class UnitExecutor(Node):
             run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
 
         elif cid == "transit_xy":
-            # Prefer normalized JSON values, but allow typed action fields as fallback.
             north_m = float(parsed.north_m)
             east_m = float(parsed.east_m)
-            if abs(north_m) < 1e-9 and hasattr(goal, "north_m"):
-                north_m = float(getattr(goal, "north_m"))
-            if abs(east_m) < 1e-9 and hasattr(goal, "east_m"):
-                east_m = float(getattr(goal, "east_m"))
+            if abs(north_m) < 1e-9:
+                north_m = float(north_m_typed)
+            if abs(east_m) < 1e-9:
+                east_m = float(east_m_typed)
 
-            # Current heading source:
-            # - no magnetometer: ignored (relative_fallback mode)
-            # - has magnetometer: use cached value (seeded from heading_rad param)
-            # Future: when heading subscription is enabled, callback updates cache.
             heading_rad = None
             if self.has_magnetometer:
                 heading_rad = float(self._latest_heading_rad)
@@ -431,30 +478,90 @@ class UnitExecutor(Node):
             )
             self._run_plan_sequence(compiled.plans, fb, stop_event)
 
-        # Mark success
-        goal_handle.succeed()
-        result = ExecutePlaybook.Result()
-        self._set_result_safe(
-            result,
-            success=True,
-            text=f"ok ({selected_strategy})" if selected_strategy else "ok",
-        )
-        
-        # Log successful goal execution
+        reason = f"ok ({selected_strategy})" if selected_strategy else "ok"
         goal_duration_s = time.time() - goal_start_time
         self.audit.log_command(
             robot=self.robot,
             source="orchestrator",
-            command_id=goal.command_id,
+            command_id=command_id,
             parameters=parsed.raw_params,
             status="succeeded",
             source_id=intent_id,
             duration_s=goal_duration_s,
         )
-        
-        # Clean up the active goal tracking
+        return True, reason, {"strategy": selected_strategy}
+
+    def _command_topic_cb(self, msg: String) -> None:
+        """
+        Standalone command interface (no fleet_orchestrator_interfaces required).
+        """
+        try:
+            payload = json.loads(msg.data or "{}")
+        except Exception:
+            self.get_logger().warning(f"[{self.robot}] invalid command topic JSON")
+            return
+
+        command_id = str(payload.get("command_id", "")).strip()
+        intent_id = str(payload.get("intent_id", f"topic_{int(time.time())}")).strip()
+        parameters_json = payload.get("parameters_json")
+        if not isinstance(parameters_json, str):
+            params = dict(payload.get("parameters", {}) or {})
+            parameters_json = json.dumps(params, separators=(",", ":"))
+
+        north_m = float(payload.get("north_m", 0.0))
+        east_m = float(payload.get("east_m", 0.0))
+
+        success, reason, _meta = self._execute_command_core(
+            command_id=command_id,
+            parameters_json=parameters_json,
+            intent_id=intent_id,
+            north_m_typed=north_m,
+            east_m_typed=east_m,
+            feedback_cb=None,
+            stop_event=threading.Event(),
+        )
+        self._emit_topic_result(
+            intent_id=intent_id,
+            command_id=command_id,
+            success=success,
+            reason=reason,
+        )
+
+    # ---------------- executor ----------------
+    def execute_cb(self, goal_handle):
+        """
+        Execute a validated goal by publishing a timed Twist.
+        """
+        if not HAS_FLEET_ACTION:
+            # Defensive guard: action callback should not be active without action type.
+            return None
+        goal = goal_handle.request
+        feedback = ExecutePlaybook.Feedback()
+        intent_id = goal.intent_id if hasattr(goal, "intent_id") else "unknown"
+
+        def fb(percent: float, text: str):
+            self._publish_feedback_safe(goal_handle, feedback, percent, text)
+
+        # Create a stop event so cancel requests can interrupt run_timed_twist
+        stop_event = threading.Event()
+        self._active_goals[id(goal_handle)] = stop_event
+        success, reason, _meta = self._execute_command_core(
+            command_id=str(goal.command_id),
+            parameters_json=str(goal.parameters_json),
+            intent_id=str(intent_id),
+            north_m_typed=float(getattr(goal, "north_m", 0.0)),
+            east_m_typed=float(getattr(goal, "east_m", 0.0)),
+            feedback_cb=fb,
+            stop_event=stop_event,
+        )
+
+        if success:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+        result = ExecutePlaybook.Result()
+        self._set_result_safe(result, success=success, text=reason)
         self._active_goals.pop(id(goal_handle), None)
-        
         return result
 
     def destroy_node(self) -> None:

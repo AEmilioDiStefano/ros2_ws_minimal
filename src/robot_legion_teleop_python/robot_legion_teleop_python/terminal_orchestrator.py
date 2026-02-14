@@ -29,16 +29,33 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_msgs.msg import String
+from geometry_msgs.msg import Twist
 
-from fleet_orchestrator_interfaces.action import ExecutePlaybook
+try:
+    from fleet_orchestrator_interfaces.action import ExecutePlaybook
+    HAS_FLEET_ACTION = True
+except Exception:
+    HAS_FLEET_ACTION = False
+
+    class ExecutePlaybook:  # type: ignore[override]
+        class Goal:
+            def __init__(self):
+                self.intent_id = ""
+                self.command_id = ""
+                self.vehicle_ids: List[str] = []
+                self.parameters_json = ""
+                self.north_m = 0.0
+                self.east_m = 0.0
 from .drive_profiles import load_profile_registry, resolve_robot_profile
 from .playbook_strategies import compile_transit_xy_plans
 
 
 ACTION_RE = re.compile(r"^/([^/]+)/execute_playbook$")
 ACTION_SEND_GOAL_SVC_RE = re.compile(r"^/([^/]+)/execute_playbook/_action/send_goal$")
+CMD_TOPIC_RE = re.compile(r"^/([^/]+)/execute_playbook_cmd$")
 ACTION_TYPE = "fleet_orchestrator_interfaces/action/ExecutePlaybook"
 ACTION_SEND_GOAL_TYPE = "fleet_orchestrator_interfaces/action/ExecutePlaybook_SendGoal"
+CMD_TOPIC_TYPE = "std_msgs/msg/String"
 UI_WIDTH = 31  # Match teleop's narrow terminal style.
 
 
@@ -97,6 +114,7 @@ class TerminalOrchestrator(Node):
         self._action_clients: Dict[str, ActionClient] = {}
         self._active_goal_handles: Dict[str, object] = {}
         self._cmd_vel_pubs: Dict[str, object] = {}
+        self._playbook_cmd_pubs: Dict[str, object] = {}
         self._in_emergency_stop = False
         self.selected_robot: Optional[str] = None  # None => all robots
 
@@ -179,6 +197,14 @@ class TerminalOrchestrator(Node):
         if pub is None:
             pub = self.create_publisher(Twist, topic, 10)
             self._cmd_vel_pubs[topic] = pub
+        return pub
+
+    def _get_or_make_playbook_cmd_pub(self, robot: str):
+        topic = f"/{robot}/execute_playbook_cmd"
+        pub = self._playbook_cmd_pubs.get(topic)
+        if pub is None:
+            pub = self.create_publisher(String, topic, 10)
+            self._playbook_cmd_pubs[topic] = pub
         return pub
 
     def _poll_stop_stdin(self) -> bool:
@@ -807,52 +833,67 @@ class TerminalOrchestrator(Node):
 
     def _discover_action_servers(self) -> List[Tuple[str, str]]:
         """
-        Returns list of (robot_name, action_name).
+        Returns list of (robot_name, endpoint).
+
+        Endpoint can be:
+        - /<robot>/execute_playbook      (action transport)
+        - /<robot>/execute_playbook_cmd  (standalone topic transport)
         """
         found: Dict[str, str] = {}
 
-        # Primary path: native action graph API.
-        try:
-            action_names_and_types = self.get_action_names_and_types()
-        except Exception:
-            action_names_and_types = []
-
-        for action_name, types in action_names_and_types:
-            if ACTION_TYPE not in types:
-                continue
-            m = ACTION_RE.match(action_name)
-            if not m:
-                continue
-            found[m.group(1)] = action_name
-
-        # Fallback path: discover action servers via send_goal service endpoints.
-        # This is more robust on some DDS/graph combinations where action introspection
-        # lags while services are already visible.
-        if not found:
+        if HAS_FLEET_ACTION:
+            # Primary path: native action graph API.
             try:
-                services_and_types = self.get_service_names_and_types()
+                action_names_and_types = self.get_action_names_and_types()
             except Exception:
-                services_and_types = []
-            for service_name, types in services_and_types:
-                if ACTION_SEND_GOAL_TYPE not in types:
+                action_names_and_types = []
+
+            for action_name, types in action_names_and_types:
+                if ACTION_TYPE not in types:
                     continue
-                m = ACTION_SEND_GOAL_SVC_RE.match(service_name)
+                m = ACTION_RE.match(action_name)
                 if not m:
                     continue
-                robot = m.group(1)
-                found[robot] = f"/{robot}/execute_playbook"
+                found[m.group(1)] = action_name
+
+            # Fallback path: discover action servers via send_goal service endpoints.
+            if not found:
+                try:
+                    services_and_types = self.get_service_names_and_types()
+                except Exception:
+                    services_and_types = []
+                for service_name, types in services_and_types:
+                    if ACTION_SEND_GOAL_TYPE not in types:
+                        continue
+                    m = ACTION_SEND_GOAL_SVC_RE.match(service_name)
+                    if not m:
+                        continue
+                    robot = m.group(1)
+                    found[robot] = f"/{robot}/execute_playbook"
+
+        # Standalone transport fallback via topic discovery.
+        try:
+            topic_names_and_types = self.get_topic_names_and_types()
+        except Exception:
+            topic_names_and_types = []
+        for topic_name, types in topic_names_and_types:
+            if CMD_TOPIC_TYPE not in types:
+                continue
+            m = CMD_TOPIC_RE.match(topic_name)
+            if not m:
+                continue
+            robot = m.group(1)
+            # Prefer action endpoint if already found.
+            found.setdefault(robot, topic_name)
 
         pairs = sorted(found.items(), key=lambda p: p[0])
         return pairs
 
     def _reachable_robots_map(self, probe_timeout_s: Optional[float] = None) -> Dict[str, str]:
         """
-        Return only robots whose execute_playbook action server responds to a short probe.
-
-        This filters out stale DDS graph entries (for example after hard power-off)
-        so the menu shows reachable robots instead of merely discovered names.
+        Return only robots whose playbook endpoint is currently reachable.
         """
-        discovered = {robot: action for robot, action in self._discover_action_servers()}
+        discovered = {robot: endpoint for robot, endpoint in self._discover_action_servers()}
         if not discovered:
             return {}
 
@@ -862,13 +903,15 @@ class TerminalOrchestrator(Node):
             else max(0.0, float(probe_timeout_s))
         )
         reachable: Dict[str, str] = {}
-        for robot, action_name in discovered.items():
-            client = self._get_or_make_client(action_name)
+        for robot, endpoint in discovered.items():
+            if endpoint.endswith("/execute_playbook_cmd"):
+                reachable[robot] = endpoint
+                continue
+            client = self._get_or_make_client(endpoint)
             try:
                 if client.wait_for_server(timeout_sec=timeout_s):
-                    reachable[robot] = action_name
+                    reachable[robot] = endpoint
             except Exception:
-                # Any probe error is treated as not reachable right now.
                 continue
         return reachable
 
@@ -876,6 +919,8 @@ class TerminalOrchestrator(Node):
         return self._reachable_robots_map()
 
     def _get_or_make_client(self, action_name: str) -> ActionClient:
+        if not HAS_FLEET_ACTION:
+            raise RuntimeError("Action interface not available in standalone mode")
         client = self._action_clients.get(action_name)
         if client is None:
             client = ActionClient(self, ExecutePlaybook, action_name)
@@ -883,6 +928,33 @@ class TerminalOrchestrator(Node):
         return client
 
     def _send_goal(self, robot: str, action_name: str, goal: ExecutePlaybook.Goal) -> GoalReport:
+        if action_name.endswith("/execute_playbook_cmd"):
+            payload = {
+                "intent_id": str(goal.intent_id),
+                "command_id": str(goal.command_id),
+                "vehicle_ids": list(getattr(goal, "vehicle_ids", [robot])),
+                "parameters_json": str(getattr(goal, "parameters_json", "")),
+                "north_m": float(getattr(goal, "north_m", 0.0)),
+                "east_m": float(getattr(goal, "east_m", 0.0)),
+            }
+            msg = String()
+            msg.data = json.dumps(payload, separators=(",", ":"))
+            try:
+                self._get_or_make_playbook_cmd_pub(robot).publish(msg)
+                return GoalReport(
+                    robot=robot,
+                    accepted=True,
+                    success=True,
+                    reason="dispatched via topic",
+                )
+            except Exception as ex:
+                return GoalReport(
+                    robot=robot,
+                    accepted=False,
+                    success=False,
+                    reason=f"topic dispatch failed: {ex}",
+                )
+
         client = self._get_or_make_client(action_name)
         if not client.wait_for_server(timeout_sec=2.0):
             return GoalReport(robot=robot, accepted=False, success=False, reason="server unavailable")
@@ -976,27 +1048,28 @@ class TerminalOrchestrator(Node):
 
         # Phase 1: send all goals first so robots can start at roughly the same time.
         for robot, action_name in targets:
-            client = self._get_or_make_client(action_name)
-            if not client.wait_for_server(timeout_sec=self.dispatch_timeout_s):
-                reason = (
-                    f"skipped due to timeout: waited > {self.dispatch_timeout_s:.1f}s "
-                    "for action server"
-                )
-                self._emit_json_event(
-                    "audit",
-                    {
-                        "type": "audit_event",
-                        "stage": "execute_playbook_dispatch",
-                        "intent_id": "",
-                        "robot": robot,
-                        "status": "skipped",
-                        "details": reason,
-                    },
-                )
-                reports.append(
-                    GoalReport(robot=robot, accepted=False, success=False, reason=reason)
-                )
-                continue
+            if not action_name.endswith("/execute_playbook_cmd"):
+                client = self._get_or_make_client(action_name)
+                if not client.wait_for_server(timeout_sec=self.dispatch_timeout_s):
+                    reason = (
+                        f"skipped due to timeout: waited > {self.dispatch_timeout_s:.1f}s "
+                        "for action server"
+                    )
+                    self._emit_json_event(
+                        "audit",
+                        {
+                            "type": "audit_event",
+                            "stage": "execute_playbook_dispatch",
+                            "intent_id": "",
+                            "robot": robot,
+                            "status": "skipped",
+                            "details": reason,
+                        },
+                    )
+                    reports.append(
+                        GoalReport(robot=robot, accepted=False, success=False, reason=reason)
+                    )
+                    continue
             goal = goal_factory(robot)
             preview = self._build_motion_preview(robot, goal)
             dispatch_task = {
@@ -1017,8 +1090,24 @@ class TerminalOrchestrator(Node):
                 "preview": preview,
             }
             self._emit_json_event("task", dispatch_task)
-            send_future = client.send_goal_async(goal)
-            pending[robot] = {"send_future": send_future, "intent_id": str(goal.intent_id)}
+            if action_name.endswith("/execute_playbook_cmd"):
+                send_report = self._send_goal(robot, action_name, goal)
+                status = "succeeded" if (send_report.accepted and send_report.success) else "failed"
+                self._emit_json_event(
+                    "audit",
+                    {
+                        "type": "audit_event",
+                        "stage": "execute_playbook_dispatch",
+                        "intent_id": str(goal.intent_id),
+                        "robot": robot,
+                        "status": status,
+                        "details": send_report.reason,
+                    },
+                )
+                reports.append(send_report)
+            else:
+                send_future = client.send_goal_async(goal)
+                pending[robot] = {"send_future": send_future, "intent_id": str(goal.intent_id)}
 
         if not pending:
             return reports
@@ -1391,18 +1480,203 @@ class TerminalOrchestrator(Node):
             return "4"
         return None
 
+    def _normalize_sequence_entry_from_json_step(
+        self, step: Dict[str, Any], index: int
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Normalize one JSON sequence step into the internal queue entry format.
+
+        Accepted input shape (fleet-ready):
+          {"playbook": "...", "label": "...", "params": {...}}
+        """
+        playbook = str(step.get("playbook", "")).strip()
+        label = str(step.get("label", "")).strip()
+        params = dict(step.get("params", {}) or {})
+
+        if playbook not in (
+            "move_xy",
+            "execute_all_commands",
+            "transit_distance",
+            "rotate_degrees",
+        ):
+            return None, f"step {index}: unsupported playbook '{playbook}'"
+
+        if playbook == "move_xy":
+            try:
+                x_m = float(params.get("x_m", 0.0))
+                y_m = float(params.get("y_m", 0.0))
+                speed = max(0.05, min(1.5, float(params.get("speed", self.default_speed_scale))))
+                max_detour_m = max(0.05, float(params.get("max_detour_m", 0.8)))
+            except Exception:
+                return None, f"step {index}: invalid move_xy numeric params"
+
+            main_robot = str(params.get("main_robot", "")).strip()
+            if not main_robot:
+                return None, f"step {index}: move_xy requires non-empty params.main_robot"
+
+            heading_cfg_in = dict(params.get("heading_cfg", {}) or {})
+            heading_cfg: Dict[str, Dict[str, float]] = {}
+            for robot, cfg in heading_cfg_in.items():
+                try:
+                    heading_clock = float(dict(cfg or {}).get("heading_clock", 12.0)) % 12.0
+                except Exception:
+                    heading_clock = 12.0
+                heading_cfg[str(robot)] = {"heading_clock": heading_clock}
+
+            detected_robots = [str(r) for r in list(params.get("detected_robots", []))]
+
+            return (
+                {
+                    "playbook": "move_xy",
+                    "label": label or "Move to objective",
+                    "params": {
+                        "detected_robots": detected_robots,
+                        "x_m": x_m,
+                        "y_m": y_m,
+                        "speed": speed,
+                        "max_detour_m": max_detour_m,
+                        "main_robot": main_robot,
+                        "heading_cfg": heading_cfg,
+                    },
+                    "deferred_input": False,
+                },
+                None,
+            )
+
+        if playbook == "execute_all_commands":
+            try:
+                speed = max(0.05, min(1.5, float(params.get("speed", 1.0))))
+            except Exception:
+                return None, f"step {index}: invalid execute_all_commands speed"
+            return (
+                {
+                    "playbook": "execute_all_commands",
+                    "label": label or "Execute ALL commands",
+                    "params": {"speed": speed},
+                    "deferred_input": False,
+                },
+                None,
+            )
+
+        if playbook == "transit_distance":
+            try:
+                meters = float(params.get("meters", 1.0))
+                speed = max(0.05, min(1.5, float(params.get("speed", self.default_speed_scale))))
+            except Exception:
+                return None, f"step {index}: invalid transit_distance params"
+            return (
+                {
+                    "playbook": "transit_distance",
+                    "label": label or "Transit distance",
+                    "params": {"meters": meters, "speed": speed},
+                    "deferred_input": False,
+                },
+                None,
+            )
+
+        # rotate_degrees
+        try:
+            degrees = float(params.get("degrees", 45.0))
+            speed = max(0.05, min(1.5, float(params.get("speed", self.default_speed_scale))))
+        except Exception:
+            return None, f"step {index}: invalid rotate_degrees params"
+        return (
+            {
+                "playbook": "rotate_degrees",
+                "label": label or "Rotate degrees",
+                "params": {"degrees": degrees, "speed": speed},
+                "deferred_input": False,
+            },
+            None,
+        )
+
+    def _load_sequence_queue_from_json_path(
+        self, path: str
+    ) -> Tuple[Optional[List[Dict[str, Any]]], List[str]]:
+        """
+        Load a queue from a JSON file.
+
+        Supported top-level shapes:
+        - Fleet request envelope: {"type":"fleet_playbook_request","sequence":[...]}
+        - Lightweight local file: {"sequence":[...]} or {"queue":[...]}
+        """
+        p = os.path.expanduser(path.strip())
+        if not p:
+            return None, ["Empty file path."]
+        if not os.path.isfile(p):
+            return None, [f"File not found: {p}"]
+
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as ex:
+            return None, [f"Failed to parse JSON: {ex}"]
+
+        if not isinstance(data, dict):
+            return None, ["Top-level JSON must be an object."]
+
+        raw_steps = data.get("sequence")
+        if raw_steps is None:
+            raw_steps = data.get("queue")
+        if not isinstance(raw_steps, list):
+            return None, ["JSON must contain 'sequence' (or 'queue') array."]
+
+        loaded: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        for idx, raw in enumerate(raw_steps, start=1):
+            if not isinstance(raw, dict):
+                errors.append(f"step {idx}: must be an object")
+                continue
+            entry, err = self._normalize_sequence_entry_from_json_step(raw, idx)
+            if err:
+                errors.append(err)
+                continue
+            if entry is not None:
+                loaded.append(entry)
+
+        if errors:
+            return None, errors
+        if not loaded:
+            return None, ["No valid sequence steps found."]
+        return loaded, []
+
     def _execute_sequence_entry(self, entry: Dict[str, Any], seq_index: int, seq_total: int) -> Dict[str, Any]:
         playbook = str(entry.get("playbook", ""))
         if playbook == "move_xy":
             params = entry.get("params", {}) or {}
+            live_detected = sorted(self._robots_map().keys())
+            configured_detected = [str(r) for r in list(params.get("detected_robots", []))]
+            if configured_detected:
+                detected_robots = [r for r in configured_detected if r in live_detected]
+                if not detected_robots:
+                    detected_robots = live_detected
+            else:
+                detected_robots = live_detected
+
+            raw_main_robot = str(params.get("main_robot", "")).strip()
+            if raw_main_robot in detected_robots:
+                main_robot = raw_main_robot
+            elif detected_robots:
+                # Invalid/stale main robot in JSON -> deterministic auto-pick first live robot.
+                main_robot = detected_robots[0]
+            else:
+                main_robot = raw_main_robot
+
+            heading_cfg = dict(params.get("heading_cfg", {}) or {})
+            # Ensure every non-main robot has a default heading_clock entry.
+            for robot in detected_robots:
+                if robot == main_robot:
+                    continue
+                heading_cfg.setdefault(robot, {"heading_clock": 12.0})
+
             run = self._run_move_xy_with_params(
-                detected_robots=[str(r) for r in list(params.get("detected_robots", []))],
+                detected_robots=detected_robots,
                 x_m=float(params.get("x_m", 1.0)),
                 y_m=float(params.get("y_m", 1.0)),
                 speed=float(params.get("speed", self.default_speed_scale)),
                 max_detour_m=float(params.get("max_detour_m", 0.8)),
-                main_robot=str(params.get("main_robot", "")),
-                heading_cfg=dict(params.get("heading_cfg", {}) or {}),
+                main_robot=main_robot,
+                heading_cfg=heading_cfg,
                 require_confirm=False,
                 render_result=False,
             )
@@ -1548,6 +1822,7 @@ class TerminalOrchestrator(Node):
                 "3) Transit distance",
                 "4) Rotate degrees",
                 "",
+                "l) Load queue JSON",
                 "e) Execute queued",
                 "d) Delete last queued",
                 "c) Clear queue",
@@ -1581,6 +1856,42 @@ class TerminalOrchestrator(Node):
             if choice in ("d", "del", "delete"):
                 if queue:
                     queue.pop()
+                continue
+            if choice in ("l", "load"):
+                default_json = (
+                    "~/ros2_ws/src/robot_legion_teleop_python/config/presets/"
+                    "fleet_preset_sequence_patrol.json"
+                )
+                path_raw = input(f"JSON file path [{default_json}]: ").strip()
+                if path_raw.lower() in ("b", "back", "0", "q", "quit"):
+                    continue
+                path = path_raw or default_json
+                mode_raw = input("Load mode: replace or append [replace]: ").strip().lower()
+                if mode_raw in ("b", "back", "0", "q", "quit"):
+                    continue
+                mode = "append" if mode_raw in ("a", "append") else "replace"
+                loaded, errors = self._load_sequence_queue_from_json_path(path)
+                if loaded is None:
+                    self._print_screen(
+                        "LOAD QUEUE FAILED",
+                        [f"Path: {os.path.expanduser(path)}", ""] + errors[:8],
+                    )
+                    self._pause()
+                    continue
+                if mode == "replace":
+                    queue = loaded
+                else:
+                    queue.extend(loaded)
+                self._print_screen(
+                    "QUEUE LOADED",
+                    [
+                        f"Path: {os.path.expanduser(path)}",
+                        f"Mode: {mode}",
+                        f"Loaded steps: {len(loaded)}",
+                        f"Queue size: {len(queue)}",
+                    ],
+                )
+                self._pause()
                 continue
             if choice in ("u", "update"):
                 if not queue:
@@ -2451,7 +2762,7 @@ class TerminalOrchestrator(Node):
                 lines.append(f"- {robot}")
         else:
             lines.append("")
-            lines.append("No execute_playbook servers")
+            lines.append("No playbook endpoints")
         self._print_screen("TERMINAL ORCHESTRATOR", lines)
         raw_choice = input("Choice: ")
         if self._is_stop_cmd(raw_choice):

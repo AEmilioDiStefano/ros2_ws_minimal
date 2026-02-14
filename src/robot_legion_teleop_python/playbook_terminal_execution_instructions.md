@@ -8,6 +8,11 @@ Assumptions:
 - Linux username on each robot should match a key in `config/robot_profiles.yaml` (for example: `robot1`, `robot2`, `robot3`).
 - All machines are on the same network and use the same ROS domain ID.
 
+Standalone note:
+- `robot_legion_teleop_python` now runs without `fleet_orchestrator_interfaces`.
+- If interfaces are present, it uses action transport (`/execute_playbook`).
+- If interfaces are absent, it automatically uses standalone topic transport (`/execute_playbook_cmd`).
+
 ## 1) On each robot Pi (fresh SSH session)
 
 Open one SSH terminal per robot, then run:
@@ -15,7 +20,7 @@ Open one SSH terminal per robot, then run:
 ```bash
 cd "$HOME/ros2_ws"
 source /opt/ros/"${ROS_DISTRO:-jazzy}"/setup.bash
-colcon build --packages-select robot_legion_teleop_python fleet_orchestrator_interfaces
+colcon build --packages-select robot_legion_teleop_python
 source "$HOME/ros2_ws/install/setup.bash"
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
@@ -54,14 +59,15 @@ ros2 launch robot_legion_teleop_python robot_bringup.launch.py \
 
 Expected in logs:
 - `UnitExecutor ready`
-- `action=/<robot_name>/execute_playbook`
+- `action=/<robot_name>/execute_playbook` (if `fleet_orchestrator_interfaces` is installed)
+- `cmd_iface=/<robot_name>/execute_playbook_cmd` (always, standalone-safe)
 
 ## 2) On laptop (fresh terminal)
 
 ```bash
 cd "$HOME/ros2_ws"
 source /opt/ros/"${ROS_DISTRO:-jazzy}"/setup.bash
-colcon build --packages-select robot_legion_teleop_python fleet_orchestrator_interfaces
+colcon build --packages-select robot_legion_teleop_python
 source "$HOME/ros2_ws/install/setup.bash"
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
@@ -89,6 +95,12 @@ echo "Found ${#ACTIONS[@]} execute_playbook servers"
 printf '%s\n' "${ACTIONS[@]}"
 ```
 
+Discover standalone command topics (works without fleet interfaces):
+
+```bash
+ros2 topic list | grep -E '^/.+/execute_playbook_cmd$'
+```
+
 If count is `0`, check:
 - Same `ROS_DOMAIN_ID` on laptop and all robots.
 - Robot launch logs show executor started.
@@ -107,8 +119,10 @@ You should see:
 
 Detection behavior:
 - `Detected robots` now means **reachable** robots, not just graph-discovered names.
-- `terminal_orchestrator` probes each discovered `/<robot>/execute_playbook`
-  action server with a short timeout and only lists responders.
+- `terminal_orchestrator` supports two transports:
+  - action: `/<robot>/execute_playbook` (when `fleet_orchestrator_interfaces` exists)
+  - standalone topic: `/<robot>/execute_playbook_cmd` (always available)
+- If action transport exists, it is preferred.
 - Probe timeout parameter:
   - `reachable_probe_timeout_s` (default `0.15`)
 
@@ -124,9 +138,10 @@ UI controls:
 - `q` quit
 
 Playbook sequence submenu:
-- Header shows `PLAYBOOK SEQUENCE` (separate from the main menu header).
+- Header shows `EXECUTE PLAYBOOK SEQUENCE` (separate from the main menu header).
 - Lets you queue from the same playbooks (`1/2/3/4`) and run them in order.
 - Queue controls:
+  - `l` load queue from JSON file
   - `e` execute queued playbooks
   - `d` delete last queued playbook
   - `c` clear queue
@@ -138,13 +153,26 @@ Playbook sequence submenu:
   - non-interactive per step (no per-step pause, no per-step confirmation).
   - one final `SEQUENCE SUMMARY` screen after the queue run.
   - one final pretty-printed (indented) JSON block for copy/paste.
+- JSON queue loading (`l`):
+  - Enter a JSON file path (default points to `config/presets/fleet_preset_sequence_patrol.json`).
+  - Choose load mode:
+    - `replace`: replace current queue with file content
+    - `append`: append file content to current queue
+  - Supported JSON top-level shapes:
+    - Fleet envelope: `{ "type": "fleet_playbook_request", "sequence": [ ... ] }`
+    - Lightweight local: `{ "sequence": [ ... ] }` or `{ "queue": [ ... ] }`
+  - Each step object must contain:
+    - `playbook`: one of `move_xy`, `execute_all_commands`, `transit_distance`, `rotate_degrees`
+    - `params`: playbook parameters
+    - optional `label`
 - Playbook `1` in sequence mode:
   - fully queueable now.
-  - captures all playbook-1 variables up front when added:
+  - captures playbook-1 variables either from prompts or JSON:
     - `x`, `y`, `speed`, `MAX PATH OFFSET`,
     - main robot selection,
-    - per-robot relative config (distance, clock, heading clock).
+    - per-robot heading config (`heading_clock`).
   - executes non-interactively during sequence run using those captured values.
+  - If JSON contains stale/missing `detected_robots` or invalid `main_robot`, runtime auto-resolves from currently reachable robots.
 
 Execution flow:
 1. Choose target robots.
