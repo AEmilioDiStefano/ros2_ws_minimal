@@ -66,20 +66,20 @@ robots:
         # Safety tune for V-path planner load:
         # reduce detour aggressiveness on robot2 to limit current spikes.
         orchestrator_max_detour_scale: 0.45
-        # Lower motion caps for safer current draw on mecanum platform.
-        max_linear_mps: 0.28
-        max_angular_rps: 1.2
-        spin_speed_mult: 0.5
+        # Balanced tune: faster than prior safe-mode while keeping current bounded.
+        max_linear_mps: 0.34
+        max_angular_rps: 1.5
+        spin_speed_mult: 0.6
         # Re-enable stall protection.
         stall_timeout_s: 0.6
         stall_duty_pct: 70
       hardware:
-        # Reduce peak current and smooth step-changes.
-        max_pwm: 68
-        pwm_ramp_ms: 180
+        # Keep smoother step-changes but allow higher top speed.
+        max_pwm: 78
+        pwm_ramp_ms: 120
         pwm_deadband_pct: 3
         cmd_rate_hz: 40
-        pwm_slew_pct_per_s: 140
+        pwm_slew_pct_per_s: 220
 
   robot3:
     drive_profile: diff_drive

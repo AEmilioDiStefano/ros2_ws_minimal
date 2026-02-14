@@ -1164,6 +1164,7 @@ class TerminalOrchestrator(Node):
             return reports
 
         pending: Dict[str, Dict[str, object]] = {}
+        pending_topic: Dict[str, Dict[str, str]] = {}
 
         # Phase 1: send all goals first so robots can start at roughly the same time.
         for robot, action_name in targets:
@@ -1210,25 +1211,56 @@ class TerminalOrchestrator(Node):
             }
             self._emit_json_event("task", dispatch_task)
             if action_name.endswith("/execute_playbook_cmd"):
-                send_report = self._send_goal(robot, action_name, goal)
-                status = "succeeded" if (send_report.accepted and send_report.success) else "failed"
+                intent_id = str(goal.intent_id)
+                self._ensure_playbook_result_sub(robot)
+                # Drop any stale result with same intent id before dispatch.
+                self._topic_results.pop((robot, intent_id), None)
+                payload = {
+                    "intent_id": intent_id,
+                    "command_id": str(goal.command_id),
+                    "vehicle_ids": list(getattr(goal, "vehicle_ids", [robot])),
+                    "parameters_json": str(getattr(goal, "parameters_json", "")),
+                    "north_m": float(getattr(goal, "north_m", 0.0)),
+                    "east_m": float(getattr(goal, "east_m", 0.0)),
+                }
+                msg = String()
+                msg.data = json.dumps(payload, separators=(",", ":"))
+                try:
+                    self._get_or_make_playbook_cmd_pub(robot).publish(msg)
+                except Exception as ex:
+                    reason = f"topic dispatch failed: {ex}"
+                    self._emit_json_event(
+                        "audit",
+                        {
+                            "type": "audit_event",
+                            "stage": "execute_playbook_dispatch",
+                            "intent_id": intent_id,
+                            "robot": robot,
+                            "status": "failed",
+                            "details": reason,
+                        },
+                    )
+                    reports.append(
+                        GoalReport(robot=robot, accepted=False, success=False, reason=reason)
+                    )
+                    continue
+                pending_topic[robot] = {"intent_id": intent_id}
                 self._emit_json_event(
                     "audit",
                     {
                         "type": "audit_event",
                         "stage": "execute_playbook_dispatch",
-                        "intent_id": str(goal.intent_id),
+                        "intent_id": intent_id,
                         "robot": robot,
-                        "status": status,
-                        "details": send_report.reason,
+                        "status": "dispatched",
+                        "details": "topic dispatched",
                     },
                 )
-                reports.append(send_report)
             else:
                 send_future = client.send_goal_async(goal)
                 pending[robot] = {"send_future": send_future, "intent_id": str(goal.intent_id)}
 
-        if not pending:
+        if not pending and not pending_topic:
             return reports
 
         # Wait for send_goal responses.
@@ -1279,9 +1311,15 @@ class TerminalOrchestrator(Node):
                 "intent_id": state.get("intent_id", ""),
             }
 
-        if result_pending:
+        if result_pending or pending_topic:
             self._spin_until(
-                lambda: all(state["future"].done() for state in result_pending.values()),
+                lambda: (
+                    all(state["future"].done() for state in result_pending.values())
+                    and all(
+                        (robot, str(state["intent_id"])) in self._topic_results
+                        for robot, state in pending_topic.items()
+                    )
+                ),
                 timeout_sec=90.0,
             )
 
@@ -1345,6 +1383,41 @@ class TerminalOrchestrator(Node):
                 GoalReport(robot=robot, accepted=accepted, success=success, reason=reason)
             )
             self._active_goal_handles.pop(robot, None)
+
+        for robot, state in pending_topic.items():
+            intent_id = str(state.get("intent_id", ""))
+            rep = self._topic_results.pop((robot, intent_id), None)
+            if rep is None:
+                reason = "topic result timeout"
+                self._emit_json_event(
+                    "audit",
+                    {
+                        "type": "audit_event",
+                        "stage": "execute_playbook_dispatch",
+                        "intent_id": intent_id,
+                        "robot": robot,
+                        "status": "failed",
+                        "details": reason,
+                    },
+                )
+                reports.append(
+                    GoalReport(robot=robot, accepted=True, success=False, reason=reason)
+                )
+                continue
+
+            status = "succeeded" if (rep.accepted and rep.success) else "failed"
+            self._emit_json_event(
+                "audit",
+                {
+                    "type": "audit_event",
+                    "stage": "execute_playbook_dispatch",
+                    "intent_id": intent_id,
+                    "robot": robot,
+                    "status": status,
+                    "details": rep.reason,
+                },
+            )
+            reports.append(rep)
 
         return reports
 

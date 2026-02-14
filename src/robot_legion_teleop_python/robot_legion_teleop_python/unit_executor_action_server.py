@@ -474,84 +474,95 @@ class UnitExecutor(Node):
             stop_event = threading.Event()
         composite_stop = UnitExecutor._CompositeStopEvent(stop_event, self._human_override_event)
 
-        if cid == "hold":
-            plan = TimedTwistPlan(twist=Twist(), duration_s=duration_s, status_text="holding")
-            run_timed_twist(self._publish, fb, plan, rate_hz=10.0, stop_at_end=True, stop_event=composite_stop)
+        try:
+            if cid == "hold":
+                plan = TimedTwistPlan(twist=Twist(), duration_s=duration_s, status_text="holding")
+                run_timed_twist(self._publish, fb, plan, rate_hz=10.0, stop_at_end=True, stop_event=composite_stop)
 
-        elif cid == "rotate":
-            twist = Twist()
-            twist.angular.z = w if direction in ("left", "ccw") else -w
-            plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"rotate {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
+            elif cid == "rotate":
+                twist = Twist()
+                twist.angular.z = w if direction in ("left", "ccw") else -w
+                plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"rotate {direction}")
+                run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
 
-        elif cid == "transit":
-            twist = Twist()
-            twist.linear.x = -v if direction in ("backward", "back", "-x") else +v
-            plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"transit {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
+            elif cid == "transit":
+                twist = Twist()
+                twist.linear.x = -v if direction in ("backward", "back", "-x") else +v
+                plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"transit {direction}")
+                run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
 
-        elif cid == "strafe":
-            twist = Twist()
-            if self.drive_type == "mecanum":
-                twist.linear.y = +vy if direction in ("left", "+y") else -vy
-            plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"strafe {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
+            elif cid == "strafe":
+                twist = Twist()
+                if self.drive_type == "mecanum":
+                    twist.linear.y = +vy if direction in ("left", "+y") else -vy
+                plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"strafe {direction}")
+                run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
 
-        elif cid == "diagonal":
-            twist = Twist()
-            if self.drive_type == "mecanum":
-                if direction == "fwd_left":
-                    twist.linear.x, twist.linear.y = +v, +vy
-                elif direction == "fwd_right":
-                    twist.linear.x, twist.linear.y = +v, -vy
-                elif direction == "back_left":
-                    twist.linear.x, twist.linear.y = -v, +vy
+            elif cid == "diagonal":
+                twist = Twist()
+                if self.drive_type == "mecanum":
+                    if direction == "fwd_left":
+                        twist.linear.x, twist.linear.y = +v, +vy
+                    elif direction == "fwd_right":
+                        twist.linear.x, twist.linear.y = +v, -vy
+                    elif direction == "back_left":
+                        twist.linear.x, twist.linear.y = -v, +vy
+                    else:
+                        twist.linear.x, twist.linear.y = -v, -vy
+                plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"diagonal {direction}")
+                run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
+
+            elif cid == "turn":
+                twist = Twist()
+                if self.drive_type == "diff_drive":
+                    twist.linear.x = turn_v
+                    twist.angular.z = w if direction in ("left", "ccw") else -w
+                    status = f"turn {direction}"
                 else:
-                    twist.linear.x, twist.linear.y = -v, -vy
-            plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"diagonal {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
+                    twist.angular.z = w if direction in ("left", "ccw") else -w
+                    status = f"rotate {direction}"
+                plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=status)
+                run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
 
-        elif cid == "turn":
-            twist = Twist()
-            if self.drive_type == "diff_drive":
-                twist.linear.x = turn_v
-                twist.angular.z = w if direction in ("left", "ccw") else -w
-                status = f"turn {direction}"
-            else:
-                twist.angular.z = w if direction in ("left", "ccw") else -w
-                status = f"rotate {direction}"
-            plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=status)
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
+            elif cid == "transit_xy":
+                north_m = float(parsed.north_m)
+                east_m = float(parsed.east_m)
+                if abs(north_m) < 1e-9:
+                    north_m = float(north_m_typed)
+                if abs(east_m) < 1e-9:
+                    east_m = float(east_m_typed)
 
-        elif cid == "transit_xy":
-            north_m = float(parsed.north_m)
-            east_m = float(parsed.east_m)
-            if abs(north_m) < 1e-9:
-                north_m = float(north_m_typed)
-            if abs(east_m) < 1e-9:
-                east_m = float(east_m_typed)
+                heading_rad = None
+                if self.has_magnetometer:
+                    heading_rad = float(self._latest_heading_rad)
 
-            heading_rad = None
-            if self.has_magnetometer:
-                heading_rad = float(self._latest_heading_rad)
-
-            compiled = compile_transit_xy_plans(
-                drive_type=self.drive_type,
-                hardware=self.hardware,
-                north_m=north_m,
-                east_m=east_m,
-                v_fwd=v,
-                v_strafe=vy,
-                w_rot=w,
-                cardinal_mode=self.cardinal_mode,
-                heading_rad=heading_rad,
-            )
-            selected_strategy = compiled.strategy_id
-            self.get_logger().info(
-                f"[{self.robot}] transit_xy north={north_m:.3f}m east={east_m:.3f}m "
-                f"cardinal_mode={self.cardinal_mode} strategy={selected_strategy} steps={len(compiled.plans)}"
-            )
-            self._run_plan_sequence(compiled.plans, fb, composite_stop)
+                compiled = compile_transit_xy_plans(
+                    drive_type=self.drive_type,
+                    hardware=self.hardware,
+                    north_m=north_m,
+                    east_m=east_m,
+                    v_fwd=v,
+                    v_strafe=vy,
+                    w_rot=w,
+                    cardinal_mode=self.cardinal_mode,
+                    heading_rad=heading_rad,
+                )
+                selected_strategy = compiled.strategy_id
+                self.get_logger().info(
+                    f"[{self.robot}] transit_xy north={north_m:.3f}m east={east_m:.3f}m "
+                    f"cardinal_mode={self.cardinal_mode} strategy={selected_strategy} steps={len(compiled.plans)}"
+                )
+                self._run_plan_sequence(compiled.plans, fb, composite_stop)
+        finally:
+            # Safety brake: publish zero twist after every command execution path.
+            # This avoids lingering motion if the last non-zero command persists
+            # in downstream transport timing edge-cases.
+            try:
+                self._publish(Twist())
+                time.sleep(0.02)
+                self._publish(Twist())
+            except Exception:
+                pass
 
         reason = f"ok ({selected_strategy})" if selected_strategy else "ok"
         goal_duration_s = time.time() - goal_start_time
