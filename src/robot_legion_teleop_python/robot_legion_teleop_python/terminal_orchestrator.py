@@ -121,6 +121,7 @@ class TerminalOrchestrator(Node):
         self._topic_results: Dict[Tuple[str, str], GoalReport] = {}
         self._human_override_subs: Dict[str, object] = {}
         self._human_override_last_active: Dict[str, float] = {}
+        self._last_saved_preset_name: str = ""
         self._in_emergency_stop = False
         self.selected_robot: Optional[str] = None  # None => all robots
 
@@ -272,6 +273,18 @@ class TerminalOrchestrator(Node):
         if t <= 0.0:
             return False
         return (time.monotonic() - t) <= max(0.05, float(self.human_override_ttl_s))
+
+    def _robot_has_live_heartbeat(self, robot: str) -> bool:
+        """
+        Require a live heartbeat publisher to treat a robot endpoint as reachable.
+        This removes stale DDS action entries after robots power off.
+        """
+        topic = f"/{robot}/heartbeat"
+        try:
+            pubs = self.get_publishers_info_by_topic(topic)
+        except Exception:
+            pubs = []
+        return len(pubs) > 0
 
     def _poll_stop_stdin(self) -> bool:
         """
@@ -985,6 +998,8 @@ class TerminalOrchestrator(Node):
 
         reachable: Dict[str, str] = {}
         for robot, endpoint in discovered.items():
+            if not self._robot_has_live_heartbeat(robot):
+                continue
             if endpoint.endswith("/execute_playbook_cmd"):
                 reachable[robot] = endpoint
                 continue
@@ -1744,6 +1759,98 @@ class TerminalOrchestrator(Node):
             return None, ["No valid sequence steps found."]
         return loaded, []
 
+    def _default_presets_dir(self) -> str:
+        return os.path.expanduser("~/ros2_ws/src/robot_legion_teleop_python/config/presets")
+
+    def _list_sequence_preset_files(self) -> List[str]:
+        base = self._default_presets_dir()
+        try:
+            names = sorted(
+                [
+                    n
+                    for n in os.listdir(base)
+                    if n.lower().endswith(".json")
+                    and os.path.isfile(os.path.join(base, n))
+                ]
+            )
+        except Exception:
+            return []
+        return names
+
+    def _resolve_preset_path(self, user_input: str, default_name: str) -> str:
+        """
+        Resolve a user-entered preset reference into an absolute JSON file path.
+
+        Rules:
+        - empty input -> default_name in presets dir
+        - no slash -> treat as preset name under presets dir
+        - if name/path has no .json suffix, append it
+        """
+        raw = str(user_input or "").strip()
+        base = self._default_presets_dir()
+        if not raw:
+            raw = default_name
+        # Name-only mode: keep user in presets dir by default.
+        if "/" not in raw:
+            raw = os.path.join(base, raw)
+        path = os.path.expanduser(raw)
+        if not path.lower().endswith(".json"):
+            path = path + ".json"
+        return path
+
+    def _save_sequence_queue_to_json_path(
+        self, queue: List[Dict[str, Any]], path: str
+    ) -> Tuple[bool, str]:
+        if not queue:
+            return False, "Queue is empty."
+        p = os.path.expanduser(str(path or "").strip())
+        if not p:
+            return False, "Empty file path."
+        parent = os.path.dirname(p) or "."
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception as ex:
+            return False, f"Failed to create directory: {ex}"
+
+        sequence: List[Dict[str, Any]] = []
+        for i, entry in enumerate(queue, start=1):
+            sequence.append(
+                {
+                    "step_id": f"step-{i}",
+                    "label": str(entry.get("label", f"Step {i}")),
+                    "playbook": str(entry.get("playbook", "")),
+                    "params": dict(entry.get("params", {}) or {}),
+                }
+            )
+
+        payload = {
+            "schema_version": "1.0",
+            "type": "fleet_playbook_request",
+            "request_id": f"preset.saved.{int(time.time())}",
+            "target": {"mode": "all"},
+            "execution": {
+                "mode": "live",
+                "require_confirm": False,
+                "non_interactive": True,
+                "stop_on_error": False,
+                "reachable_timeout_s": 1.0,
+            },
+            "sequence": sequence,
+            "trace": {
+                "translator": "terminal_orchestrator",
+                "confidence": 1.0,
+                "explanation": "saved from execute playbook sequence menu",
+            },
+        }
+
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.write("\n")
+        except Exception as ex:
+            return False, f"Failed to write preset: {ex}"
+        return True, p
+
     def _execute_sequence_entry(self, entry: Dict[str, Any], seq_index: int, seq_total: int) -> Dict[str, Any]:
         playbook = str(entry.get("playbook", ""))
         if playbook == "move_xy":
@@ -1914,6 +2021,7 @@ class TerminalOrchestrator(Node):
     def _playbook_sequence_menu(self):
         queue: List[Dict[str, Any]] = []
         while rclpy.ok():
+            preset_names = self._list_sequence_preset_files()
             lines = [
                 "Build and run playbook queue",
                 "",
@@ -1926,7 +2034,22 @@ class TerminalOrchestrator(Node):
                 "3) Transit distance",
                 "4) Rotate degrees",
                 "",
+                f"Preset queue files: {len(preset_names)}",
+            ]
+            if preset_names:
+                for n in preset_names[:12]:
+                    lines.append(f"- {n}")
+                if len(preset_names) > 12:
+                    lines.append(f"... ({len(preset_names)} total)")
+            else:
+                lines.append("- none found")
+            if self._last_saved_preset_name:
+                lines.append(f"Last saved: {self._last_saved_preset_name}")
+            lines.extend(
+                [
+                "",
                 "l) Load queue JSON",
+                "n) Save queue as preset",
                 "e) Execute queued",
                 "d) Delete last queued",
                 "c) Clear queue",
@@ -1937,7 +2060,8 @@ class TerminalOrchestrator(Node):
                 "u) Update by number",
                 "x) Delete by number",
                 "",
-            ]
+                ]
+            )
             if queue:
                 lines.append("")
                 lines.append("Queued:")
@@ -1962,14 +2086,23 @@ class TerminalOrchestrator(Node):
                     queue.pop()
                 continue
             if choice in ("l", "load"):
-                default_json = (
-                    "~/ros2_ws/src/robot_legion_teleop_python/config/presets/"
-                    "fleet_preset_sequence_patrol.json"
-                )
-                path_raw = input(f"JSON file path [{default_json}]: ").strip()
+                default_name = "fleet_preset_sequence_patrol"
+                path_raw = input(
+                    f"Preset name [{default_name}] (? lists presets): "
+                ).strip()
                 if path_raw.lower() in ("b", "back", "0", "q", "quit"):
                     continue
-                path = path_raw or default_json
+                if path_raw == "?":
+                    presets = self._list_sequence_preset_files()
+                    lines_show = [f"Preset dir: {self._default_presets_dir()}", ""]
+                    if presets:
+                        lines_show.extend([f"- {n}" for n in presets])
+                    else:
+                        lines_show.append("No preset JSON files found.")
+                    self._print_screen("AVAILABLE PRESETS", lines_show)
+                    self._pause()
+                    continue
+                path = self._resolve_preset_path(path_raw, default_name)
                 mode_raw = input("Load mode: replace or append [replace]: ").strip().lower()
                 if mode_raw in ("b", "back", "0", "q", "quit"):
                     continue
@@ -1995,6 +2128,33 @@ class TerminalOrchestrator(Node):
                         f"Queue size: {len(queue)}",
                     ],
                 )
+                self._pause()
+                continue
+            if choice in ("n", "new", "save"):
+                if not queue:
+                    self._print_screen("SAVE PRESET", ["Queue is empty."])
+                    self._pause()
+                    continue
+                default_name = "fleet_preset_custom"
+                path_raw = input(f"Save preset name [{default_name}]: ").strip()
+                if path_raw.lower() in ("b", "back", "0", "q", "quit"):
+                    continue
+                path = self._resolve_preset_path(path_raw, default_name)
+                ok, detail = self._save_sequence_queue_to_json_path(queue, path)
+                if not ok:
+                    self._print_screen("SAVE PRESET FAILED", [detail])
+                    self._pause()
+                    continue
+                self._print_screen(
+                    "PRESET SAVED",
+                    [
+                        f"Path: {detail}",
+                        f"Name: {os.path.basename(detail)}",
+                        f"Queued steps: {len(queue)}",
+                        "Use 'l' to load it later.",
+                    ],
+                )
+                self._last_saved_preset_name = os.path.basename(detail)
                 self._pause()
                 continue
             if choice in ("u", "update"):

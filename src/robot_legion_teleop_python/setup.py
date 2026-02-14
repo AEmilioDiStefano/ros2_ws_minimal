@@ -34,9 +34,8 @@ setup(
             "fpv_control_arbiter = robot_legion_teleop_python.fpv_control_arbiter:main",
             "fpv_camera_mux = robot_legion_teleop_python.fpv_camera_mux:main",
 
-            # New “stand-in autonomy” action servers
-            "unit_executor_diffdrive = robot_legion_teleop_python.unit_executor_diffdrive_action_server:main",
-            "unit_executor_omni = robot_legion_teleop_python.unit_executor_omni_action_server:main",            "unit_executor_action_server = robot_legion_teleop_python.unit_executor_action_server:main",
+            # Unified stand-in autonomy executor
+            "unit_executor_action_server = robot_legion_teleop_python.unit_executor_action_server:main",
             
             # Heartbeat and control lock manager
             "heartbeat_node = robot_legion_teleop_python.heartbeat_node:main",

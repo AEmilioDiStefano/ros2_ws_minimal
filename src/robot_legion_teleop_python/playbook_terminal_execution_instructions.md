@@ -142,6 +142,7 @@ Playbook sequence submenu:
 - Lets you queue from the same playbooks (`1/2/3/4`) and run them in order.
 - Queue controls:
   - `l` load queue from JSON file
+  - `n` save current queue as a new preset JSON file
   - `e` execute queued playbooks
   - `d` delete last queued playbook
   - `c` clear queue
@@ -154,7 +155,10 @@ Playbook sequence submenu:
   - one final `SEQUENCE SUMMARY` screen after the queue run.
   - one final pretty-printed (indented) JSON block for copy/paste.
 - JSON queue loading (`l`):
-  - Enter a JSON file path (default points to `config/presets/fleet_preset_sequence_patrol.json`).
+  - Enter a preset **name** (not full path).
+  - Press Enter to use default (`fleet_preset_sequence_patrol`).
+  - Enter `?` to list available preset JSON files.
+  - `.json` suffix is optional; it is added automatically.
   - Choose load mode:
     - `replace`: replace current queue with file content
     - `append`: append file content to current queue
@@ -165,6 +169,15 @@ Playbook sequence submenu:
     - `playbook`: one of `move_xy`, `execute_all_commands`, `transit_distance`, `rotate_degrees`
     - `params`: playbook parameters
     - optional `label`
+- Saving a queue (`n`):
+  - Writes current `Queued:` list to a readable, indented JSON preset file.
+  - Prompt asks for preset **name**.
+  - Default name:
+    - `fleet_preset_custom`
+  - File is saved under:
+    - `~/ros2_ws/src/robot_legion_teleop_python/config/presets/`
+  - `.json` suffix is optional; it is added automatically.
+  - Saved files use the same fleet-ready envelope (`type: fleet_playbook_request`) so they can be loaded later with `l`.
 - Playbook `1` in sequence mode:
   - fully queueable now.
   - captures playbook-1 variables either from prompts or JSON:
