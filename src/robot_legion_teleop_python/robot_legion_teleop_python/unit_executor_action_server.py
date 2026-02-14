@@ -72,6 +72,7 @@ class UnitExecutor(Node):
         self.declare_parameter("has_magnetometer", False)
         self.declare_parameter("heading_rad", 0.0)
         self.declare_parameter("heading_topic", "")
+        self.declare_parameter("teleop_override_ttl_s", 0.7)
 
         self.robot = str(self.get_parameter("robot_name").value).strip() or getpass.getuser()
 
@@ -139,6 +140,16 @@ class UnitExecutor(Node):
 
         self.cmd_vel_topic = f"/{self.robot}/cmd_vel"
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+        self.human_override_topic = f"/{self.robot}/human_override"
+        self.teleop_override_ttl_s = float(self.get_parameter("teleop_override_ttl_s").value)
+        self._human_override_event = threading.Event()
+        self._last_human_override_monotonic = 0.0
+        self.human_override_sub = self.create_subscription(
+            String,
+            self.human_override_topic,
+            self._human_override_cb,
+            20,
+        )
 
         self.action_name = f"/{self.robot}/execute_playbook"
         self.command_topic = f"/{self.robot}/execute_playbook_cmd"
@@ -191,6 +202,64 @@ class UnitExecutor(Node):
             f"{self.heading_topic} (live subscription disabled; using heading_rad param/cache)"
         )
         self.get_logger().info(f"[{self.robot}] Audit log: {audit_log_path}")
+
+    def _human_override_cb(self, msg: String):
+        """
+        Teleop priority channel.
+        Expected values:
+        - plain: "1"/"true"/"active" to assert human control
+        - JSON: {"active": true}
+        """
+        raw = str(msg.data or "").strip()
+        active = False
+        if raw:
+            low = raw.lower()
+            if low in ("1", "true", "active", "yes"):
+                active = True
+            elif low in ("0", "false", "inactive", "no"):
+                active = False
+            else:
+                try:
+                    payload = json.loads(raw)
+                    active = bool(payload.get("active", False))
+                except Exception:
+                    active = False
+
+        if active:
+            self._last_human_override_monotonic = time.monotonic()
+            self._human_override_event.set()
+            # Preempt active autonomous commands immediately.
+            for ev in list(self._active_goals.values()):
+                try:
+                    ev.set()
+                except Exception:
+                    pass
+            # Immediate brake command.
+            try:
+                self._publish(Twist())
+            except Exception:
+                pass
+        else:
+            self._human_override_event.clear()
+
+    def _is_human_override_active(self) -> bool:
+        if not self._human_override_event.is_set():
+            return False
+        age = time.monotonic() - float(self._last_human_override_monotonic)
+        if age > max(0.05, float(self.teleop_override_ttl_s)):
+            self._human_override_event.clear()
+            return False
+        return True
+
+    class _CompositeStopEvent:
+        def __init__(self, a, b):
+            self._a = a
+            self._b = b
+
+        def is_set(self):
+            a_set = bool(self._a.is_set()) if self._a is not None else False
+            b_set = bool(self._b.is_set()) if self._b is not None else False
+            return a_set or b_set
 
     # FUTURE: live heading callback from magnetometer/IMU topic.
     # def _on_heading_rad(self, msg):
@@ -347,6 +416,11 @@ class UnitExecutor(Node):
         - Action interface (ExecutePlaybook)
         - Standalone topic interface (/execute_playbook_cmd)
         """
+        if self._is_human_override_active():
+            reason = "human teleop override active"
+            self.get_logger().warn(f"[{self.robot}] rejecting autonomous command: {reason}")
+            return False, reason, {}
+
         goal_start_time = time.time()
 
         ok, err, parsed = validate_and_normalize(command_id, parameters_json)
@@ -398,29 +472,30 @@ class UnitExecutor(Node):
 
         if stop_event is None:
             stop_event = threading.Event()
+        composite_stop = UnitExecutor._CompositeStopEvent(stop_event, self._human_override_event)
 
         if cid == "hold":
             plan = TimedTwistPlan(twist=Twist(), duration_s=duration_s, status_text="holding")
-            run_timed_twist(self._publish, fb, plan, rate_hz=10.0, stop_at_end=True, stop_event=stop_event)
+            run_timed_twist(self._publish, fb, plan, rate_hz=10.0, stop_at_end=True, stop_event=composite_stop)
 
         elif cid == "rotate":
             twist = Twist()
             twist.angular.z = w if direction in ("left", "ccw") else -w
             plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"rotate {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
+            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
 
         elif cid == "transit":
             twist = Twist()
             twist.linear.x = -v if direction in ("backward", "back", "-x") else +v
             plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"transit {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
+            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
 
         elif cid == "strafe":
             twist = Twist()
             if self.drive_type == "mecanum":
                 twist.linear.y = +vy if direction in ("left", "+y") else -vy
             plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"strafe {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
+            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
 
         elif cid == "diagonal":
             twist = Twist()
@@ -434,7 +509,7 @@ class UnitExecutor(Node):
                 else:
                     twist.linear.x, twist.linear.y = -v, -vy
             plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=f"diagonal {direction}")
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
+            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
 
         elif cid == "turn":
             twist = Twist()
@@ -446,7 +521,7 @@ class UnitExecutor(Node):
                 twist.angular.z = w if direction in ("left", "ccw") else -w
                 status = f"rotate {direction}"
             plan = TimedTwistPlan(twist=twist, duration_s=duration_s, status_text=status)
-            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=stop_event)
+            run_timed_twist(self._publish, fb, plan, rate_hz=20.0, stop_at_end=True, stop_event=composite_stop)
 
         elif cid == "transit_xy":
             north_m = float(parsed.north_m)
@@ -476,7 +551,7 @@ class UnitExecutor(Node):
                 f"[{self.robot}] transit_xy north={north_m:.3f}m east={east_m:.3f}m "
                 f"cardinal_mode={self.cardinal_mode} strategy={selected_strategy} steps={len(compiled.plans)}"
             )
-            self._run_plan_sequence(compiled.plans, fb, stop_event)
+            self._run_plan_sequence(compiled.plans, fb, composite_stop)
 
         reason = f"ok ({selected_strategy})" if selected_strategy else "ok"
         goal_duration_s = time.time() - goal_start_time
@@ -510,6 +585,9 @@ class UnitExecutor(Node):
 
         north_m = float(payload.get("north_m", 0.0))
         east_m = float(payload.get("east_m", 0.0))
+        stop_event = threading.Event()
+        key = f"topic:{intent_id}"
+        self._active_goals[key] = stop_event
 
         success, reason, _meta = self._execute_command_core(
             command_id=command_id,
@@ -518,8 +596,9 @@ class UnitExecutor(Node):
             north_m_typed=north_m,
             east_m_typed=east_m,
             feedback_cb=None,
-            stop_event=threading.Event(),
+            stop_event=stop_event,
         )
+        self._active_goals.pop(key, None)
         self._emit_topic_result(
             intent_id=intent_id,
             command_id=command_id,

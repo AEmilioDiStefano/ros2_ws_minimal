@@ -169,6 +169,7 @@ class RobotLegionTeleop(Node):
         # Active robot publishers (used by fpv_camera_mux)
         self.active_robot_pub = self.create_publisher(String, "/active_robot", 10)
         self.active_robot_teleop_pub = self.create_publisher(String, "/teleop/active_robot", 10)
+        self._human_override_pubs: Dict[str, object] = {}
 
         # Publisher created after robot selection
         self.publisher_ = None
@@ -236,6 +237,8 @@ class RobotLegionTeleop(Node):
         # Timers
         self.create_timer(0.1, self._republish_last_twist)
         self.create_timer(0.5, self._offline_watchdog)
+        # Human-override heartbeat so autonomous executors yield to teleop.
+        self.create_timer(0.2, self._publish_human_override)
 
         # Initial UI
         self._tprint(self.render_instructions(topic_name=None))
@@ -724,6 +727,31 @@ class RobotLegionTeleop(Node):
         self._tprint(self.render_instructions(new_topic))
         self._tprint(f"[ACTIVE ROBOT] Now controlling: {self.current_robot_name}")
 
+    def _get_or_make_human_override_pub(self, robot: str):
+        topic = f"/{robot}/human_override"
+        pub = self._human_override_pubs.get(topic)
+        if pub is None:
+            pub = self.create_publisher(String, topic, 10)
+            self._human_override_pubs[topic] = pub
+        return pub
+
+    def _publish_human_override(self):
+        if not self.current_robot_name:
+            return
+        msg = String()
+        msg.data = json.dumps(
+            {
+                "source": "teleop",
+                "active": True,
+                "ts": time.time(),
+            },
+            separators=(",", ":"),
+        )
+        try:
+            self._get_or_make_human_override_pub(self.current_robot_name).publish(msg)
+        except Exception:
+            pass
+
     # ---------------- Circle-turn helper ----------------
 
     def _publish_one_track_circle(self, v_left: float, v_right: float):
@@ -1082,6 +1110,17 @@ class RobotLegionTeleop(Node):
             try:
                 if self.publisher_ is not None:
                     self._publish_and_log_twist(Twist(), "cleanup")
+                if self.current_robot_name:
+                    msg = String()
+                    msg.data = json.dumps(
+                        {
+                            "source": "teleop",
+                            "active": False,
+                            "ts": time.time(),
+                        },
+                        separators=(",", ":"),
+                    )
+                    self._get_or_make_human_override_pub(self.current_robot_name).publish(msg)
             except Exception:
                 pass
             restore_terminal_settings(self._terminal_settings)

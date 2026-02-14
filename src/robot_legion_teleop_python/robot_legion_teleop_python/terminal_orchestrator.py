@@ -99,6 +99,7 @@ class TerminalOrchestrator(Node):
         self.declare_parameter("send_goal_response_timeout_s", 1.0)
         # Reachability probe used for menu listing so stale graph entries are hidden.
         self.declare_parameter("reachable_probe_timeout_s", 0.15)
+        self.declare_parameter("human_override_ttl_s", 0.8)
 
         self.base_linear_mps = float(self.get_parameter("base_linear_mps").value)
         self.base_strafe_mps = float(self.get_parameter("base_strafe_mps").value)
@@ -109,12 +110,17 @@ class TerminalOrchestrator(Node):
         self.dispatch_timeout_s = float(self.get_parameter("dispatch_timeout_s").value)
         self.send_goal_response_timeout_s = float(self.get_parameter("send_goal_response_timeout_s").value)
         self.reachable_probe_timeout_s = float(self.get_parameter("reachable_probe_timeout_s").value)
+        self.human_override_ttl_s = float(self.get_parameter("human_override_ttl_s").value)
 
         # Do not use name "_clients": rclpy.Node already uses that internally.
         self._action_clients: Dict[str, ActionClient] = {}
         self._active_goal_handles: Dict[str, object] = {}
         self._cmd_vel_pubs: Dict[str, object] = {}
         self._playbook_cmd_pubs: Dict[str, object] = {}
+        self._playbook_result_subs: Dict[str, object] = {}
+        self._topic_results: Dict[Tuple[str, str], GoalReport] = {}
+        self._human_override_subs: Dict[str, object] = {}
+        self._human_override_last_active: Dict[str, float] = {}
         self._in_emergency_stop = False
         self.selected_robot: Optional[str] = None  # None => all robots
 
@@ -206,6 +212,66 @@ class TerminalOrchestrator(Node):
             pub = self.create_publisher(String, topic, 10)
             self._playbook_cmd_pubs[topic] = pub
         return pub
+
+    def _ensure_playbook_result_sub(self, robot: str):
+        topic = f"/{robot}/execute_playbook_result"
+        if topic in self._playbook_result_subs:
+            return self._playbook_result_subs[topic]
+
+        def _cb(msg: String, _robot=robot):
+            try:
+                payload = json.loads(msg.data or "{}")
+            except Exception:
+                return
+            intent_id = str(payload.get("intent_id", "")).strip()
+            if not intent_id:
+                return
+            success = bool(payload.get("success", False))
+            reason = str(payload.get("reason", "")).strip() or ("ok" if success else "failed")
+            report = GoalReport(
+                robot=_robot,
+                accepted=True,
+                success=success,
+                reason=reason,
+            )
+            self._topic_results[(_robot, intent_id)] = report
+
+        sub = self.create_subscription(String, topic, _cb, 50)
+        self._playbook_result_subs[topic] = sub
+        return sub
+
+    def _ensure_human_override_sub(self, robot: str):
+        topic = f"/{robot}/human_override"
+        if topic in self._human_override_subs:
+            return self._human_override_subs[topic]
+
+        def _cb(msg: String, _robot=robot):
+            raw = str(msg.data or "").strip()
+            active = False
+            if raw:
+                low = raw.lower()
+                if low in ("1", "true", "active", "yes"):
+                    active = True
+                elif low in ("0", "false", "inactive", "no"):
+                    active = False
+                else:
+                    try:
+                        payload = json.loads(raw)
+                        active = bool(payload.get("active", False))
+                    except Exception:
+                        active = False
+            if active:
+                self._human_override_last_active[_robot] = time.monotonic()
+
+        sub = self.create_subscription(String, topic, _cb, 20)
+        self._human_override_subs[topic] = sub
+        return sub
+
+    def _is_human_override_active(self, robot: str) -> bool:
+        t = float(self._human_override_last_active.get(robot, 0.0))
+        if t <= 0.0:
+            return False
+        return (time.monotonic() - t) <= max(0.05, float(self.human_override_ttl_s))
 
     def _poll_stop_stdin(self) -> bool:
         """
@@ -902,6 +968,21 @@ class TerminalOrchestrator(Node):
             if probe_timeout_s is None
             else max(0.0, float(probe_timeout_s))
         )
+        # Standalone topic visibility map used as a robust fallback when
+        # stale action graph entries exist for a robot.
+        topic_transport: Dict[str, str] = {}
+        try:
+            topic_names_and_types = self.get_topic_names_and_types()
+        except Exception:
+            topic_names_and_types = []
+        for topic_name, types in topic_names_and_types:
+            if CMD_TOPIC_TYPE not in types:
+                continue
+            m = CMD_TOPIC_RE.match(topic_name)
+            if not m:
+                continue
+            topic_transport[m.group(1)] = topic_name
+
         reachable: Dict[str, str] = {}
         for robot, endpoint in discovered.items():
             if endpoint.endswith("/execute_playbook_cmd"):
@@ -911,12 +992,20 @@ class TerminalOrchestrator(Node):
             try:
                 if client.wait_for_server(timeout_sec=timeout_s):
                     reachable[robot] = endpoint
+                elif robot in topic_transport:
+                    # Action endpoint exists in graph but is stale/unreachable.
+                    # Fall back to standalone topic transport for that robot.
+                    reachable[robot] = topic_transport[robot]
             except Exception:
-                continue
+                if robot in topic_transport:
+                    reachable[robot] = topic_transport[robot]
         return reachable
 
     def _robots_map(self) -> Dict[str, str]:
-        return self._reachable_robots_map()
+        robots = self._reachable_robots_map()
+        for robot in robots.keys():
+            self._ensure_human_override_sub(robot)
+        return robots
 
     def _get_or_make_client(self, action_name: str) -> ActionClient:
         if not HAS_FLEET_ACTION:
@@ -929,8 +1018,12 @@ class TerminalOrchestrator(Node):
 
     def _send_goal(self, robot: str, action_name: str, goal: ExecutePlaybook.Goal) -> GoalReport:
         if action_name.endswith("/execute_playbook_cmd"):
+            intent_id = str(goal.intent_id)
+            self._ensure_playbook_result_sub(robot)
+            # Clear stale result for same intent if any.
+            self._topic_results.pop((robot, intent_id), None)
             payload = {
-                "intent_id": str(goal.intent_id),
+                "intent_id": intent_id,
                 "command_id": str(goal.command_id),
                 "vehicle_ids": list(getattr(goal, "vehicle_ids", [robot])),
                 "parameters_json": str(getattr(goal, "parameters_json", "")),
@@ -941,12 +1034,6 @@ class TerminalOrchestrator(Node):
             msg.data = json.dumps(payload, separators=(",", ":"))
             try:
                 self._get_or_make_playbook_cmd_pub(robot).publish(msg)
-                return GoalReport(
-                    robot=robot,
-                    accepted=True,
-                    success=True,
-                    reason="dispatched via topic",
-                )
             except Exception as ex:
                 return GoalReport(
                     robot=robot,
@@ -954,6 +1041,23 @@ class TerminalOrchestrator(Node):
                     success=False,
                     reason=f"topic dispatch failed: {ex}",
                 )
+            # Wait for explicit robot-side completion result to avoid queuing
+            # unchecked commands that can overlap and destabilize motion.
+            done = self._spin_until(
+                lambda: (robot, intent_id) in self._topic_results,
+                timeout_sec=90.0,
+            )
+            if not done:
+                return GoalReport(
+                    robot=robot,
+                    accepted=True,
+                    success=False,
+                    reason="topic result timeout",
+                )
+            return self._topic_results.pop(
+                (robot, intent_id),
+                GoalReport(robot=robot, accepted=True, success=False, reason="missing topic result"),
+            )
 
         client = self._get_or_make_client(action_name)
         if not client.wait_for_server(timeout_sec=2.0):
@@ -2736,10 +2840,12 @@ class TerminalOrchestrator(Node):
         rclpy.spin_once(self, timeout_sec=0.15)
         robots = sorted(self._robots_map().keys())
         active_target = self.selected_robot if self.selected_robot else "ALL"
+        override_robots = [r for r in robots if self._is_human_override_active(r)]
         lines = [
             "Terminal playbook UI",
             "",
             f"Detected robots: {len(robots)}",
+            "Human override: " + (", ".join(override_robots) if override_robots else "none"),
             f"Target: {active_target}",
             "",
             "1) Move to objective",
